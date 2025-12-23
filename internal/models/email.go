@@ -1,74 +1,72 @@
-// internal/models/email.go
 package models
 
 import (
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
+
+// BeforeCreate hook
+func (e *Email) BeforeCreate(tx *gorm.DB) error {
+	if e.ID == uuid.Nil {
+		e.ID = uuid.New()
+	}
+	if e.MessageID == "" {
+		e.MessageID = generateMessageID()
+	}
+	// Calculate thread ID if reply
+	if e.InReplyTo != "" && e.ThreadID == nil {
+		var parentEmail Email
+		if err := tx.Where("message_id = ?", e.InReplyTo).First(&parentEmail).Error; err == nil {
+			if parentEmail.ThreadID != nil {
+				e.ThreadID = parentEmail.ThreadID
+			} else {
+				e.ThreadID = &parentEmail.ID
+			}
+		}
+	}
+	// Set thread ID to self if new thread
+	if e.ThreadID == nil {
+		e.ThreadID = &e.ID
+	}
+	return nil
+}
 
 // TableName specifies the table name
 func (Email) TableName() string {
 	return "emails"
 }
 
-// TableName specifies the table name
-func (Attachment) TableName() string {
-	return "attachments"
+// Attachment with complete fields
+type Attachment struct {
+	ID             uuid.UUID      `gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
+	EmailID        uuid.UUID      `gorm:"type:uuid;not null;index;constraint:OnDelete:CASCADE"`
+	Filename       string         `gorm:"not null"`
+	ContentType    string         `gorm:"not null"`
+	ContentID      string         `gorm:"index"`
+	Size           int64          `gorm:"not null"`
+	StoragePath    string         `gorm:"not null"`
+	StorageBackend string         `gorm:"not null;default:'local'"`
+	IsInline       bool           `gorm:"default:false"`
+	Hash           string         `gorm:"index"` // SHA256 for deduplication
+	CreatedAt      time.Time      `gorm:"default:CURRENT_TIMESTAMP"`
+	DeletedAt      gorm.DeletedAt `gorm:"index"`
+
+	Email Email `gorm:"foreignKey:EmailID"`
 }
 
-// TableName specifies the table name
-func (Label) TableName() string {
-	return "labels"
-}
-
-// TableName specifies the table name
-func (Folder) TableName() string {
-	return "folders"
-}
-
-// EmailRule represents an email filtering rule
-type EmailRule struct {
-	ID         uuid.UUID `json:"id" gorm:"type:uuid;primaryKey;default:uuid_generate_v4()"`
-	UserID     uuid.UUID `json:"user_id" gorm:"type:uuid;not null;index"`
-	Name       string    `json:"name" gorm:"not null"`
-	Conditions JSONB     `json:"conditions" gorm:"type:jsonb;not null"`
-	Actions    JSONB     `json:"actions" gorm:"type:jsonb;not null"`
-	Priority   int       `json:"priority" gorm:"default:0;index:,sort:desc"`
-	IsActive   bool      `json:"is_active" gorm:"default:true"`
-	Timestamps
-}
-
-// TableName specifies the table name
-func (EmailRule) TableName() string {
-	return "email_rules"
-}
-
-// TableName specifies the table name
-func (EncryptionKey) TableName() string {
-	return "encryption_keys"
-}
-
-// EmailEncryption represents encryption metadata for an email
+// EmailEncryption stores encryption details for an email
 type EmailEncryption struct {
-	ID              uuid.UUID   `json:"id" gorm:"type:uuid;primaryKey;default:uuid_generate_v4()"`
-	EmailID         uuid.UUID   `json:"email_id" gorm:"type:uuid;not null;index"`
-	Layers          JSONB       `json:"layers" gorm:"type:jsonb;not null"`
-	KeyIDs          StringArray `json:"key_ids" gorm:"type:text[];not null"`
-	Algorithm       string      `json:"algorithm" gorm:"not null"`
-	KeySize         *int        `json:"key_size,omitempty"`
-	IsHybrid        bool        `json:"is_hybrid" gorm:"default:false"`
-	IsPQEnabled     bool        `json:"is_pq_enabled" gorm:"default:false"`
-	IsForwardSecure bool        `json:"is_forward_secure" gorm:"default:false"`
-	CreatedAt       time.Time   `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
+	ID        uuid.UUID   `gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
+	EmailID   uuid.UUID   `gorm:"type:uuid;not null;uniqueIndex;constraint:OnDelete:CASCADE"`
+	Algorithm string      `gorm:"not null"`
+	KeyIDs    StringArray `gorm:"type:text[]"`
+	CreatedAt time.Time   `gorm:"default:CURRENT_TIMESTAMP"`
+
+	Email Email `gorm:"foreignKey:EmailID"`
 }
 
-// TableName specifies the table name
-func (EmailEncryption) TableName() string {
-	return "email_encryption"
-}
-
-// TableName specifies the table name
-func (Contact) TableName() string {
-	return "contacts"
+func generateMessageID() string {
+	return "<" + uuid.New().String() + "@mxil>"
 }

@@ -4,174 +4,112 @@ package api
 import (
 	"context"
 	"fmt"
-	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
-	echolog "github.com/labstack/gommon/log"
 	"go.uber.org/zap"
 
 	"github.com/okavatti/mxil-server/m/internal/api/handlers"
+	"github.com/okavatti/mxil-server/m/internal/api/middleware"
+	"github.com/okavatti/mxil-server/m/internal/auth"
 	"github.com/okavatti/mxil-server/m/internal/config"
 )
 
-// Server represents the HTTP API server
+// Server represents the HTTP server
 type Server struct {
-	e         *echo.Echo
-	cfg       *config.Config
-	logger    *zap.Logger
-	handlers  *handlers.Handlers
-	isRunning bool
-	server    *http.Server
+	echo       *echo.Echo
+	cfg        *config.Config
+	logger     *zap.Logger
+	handlers   *handlers.Handlers
+	jwtService *auth.JWTService
+	httpServer *http.Server
 }
 
-// NewServer creates a new API server
-func NewServer(
-	cfg *config.Config,
-	logger *zap.Logger,
-	handlers *handlers.Handlers,
-) *Server {
+// NewServer creates a new server instance
+func NewServer(cfg *config.Config, logger *zap.Logger, handlers *handlers.Handlers, jwtService *auth.JWTService) *Server {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
 
-	// Configure Echo logger
-	e.Logger.SetLevel(echolog.INFO)
-	e.Logger = newEchoLogger(logger)
-
-	// Create HTTP server
-	server := &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
-		ReadTimeout:  cfg.Server.ReadTimeout,
-		WriteTimeout: cfg.Server.WriteTimeout,
-	}
+	// Configure server
+	e.Server.ReadTimeout = 30 * time.Second
+	e.Server.WriteTimeout = 30 * time.Second
+	e.Server.IdleTimeout = 120 * time.Second
 
 	return &Server{
-		e:        e,
-		cfg:      cfg,
-		logger:   logger,
-		handlers: handlers,
-		server:   server,
+		echo:       e,
+		cfg:        cfg,
+		logger:     logger,
+		handlers:   handlers,
+		jwtService: jwtService,
 	}
 }
 
-// Setup configures the server routes and middleware
+// Setup configures middleware and routes
 func (s *Server) Setup() error {
-	// Middleware
-	s.e.Use(middleware.Recover())
-	s.e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions, http.MethodPatch},
-		AllowHeaders:     []string{echo.HeaderAuthorization, echo.HeaderContentType, echo.HeaderAccept, echo.HeaderXRequestedWith},
-		ExposeHeaders:    []string{echo.HeaderContentLength, echo.HeaderContentType, "X-Total-Count"},
+	// Global middleware
+	s.echo.Use(middleware.Recover())
+	s.echo.Use(middleware.Secure())
+	s.echo.Use(middleware.RequestID())
+	s.echo.Use(s.loggingMiddleware())
+
+	// CORS configuration
+	s.echo.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins:     []string{"*"}, // In production, specify domains
+		AllowMethods:     []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete, http.MethodOptions},
+		AllowHeaders:     []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, echo.HeaderAuthorization, "X-Requested-With"},
 		AllowCredentials: true,
 		MaxAge:           86400,
 	}))
-	s.e.Use(middleware.SecureWithConfig(middleware.SecureConfig{
-		XSSProtection:         "1; mode=block",
-		ContentTypeNosniff:    "nosniff",
-		XFrameOptions:         "DENY",
-		HSTSMaxAge:            31536000,
-		ContentSecurityPolicy: "default-src 'self'",
-	}))
-	s.e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
-		Level: 5,
-	}))
-	s.e.Use(middleware.RequestLogger())
-	s.e.Use(middleware.RequestID())
 
 	// Rate limiting
-	rateLimiterConfig := middleware.RateLimiterConfig{
-		Skipper: middleware.DefaultSkipper,
-		Store: middleware.NewRateLimiterMemoryStoreWithConfig(
-			middleware.RateLimiterMemoryStoreConfig{
-				Rate:      10, // requests per second
-				Burst:     30,
-				ExpiresIn: 3 * time.Minute,
-			},
-		),
-		IdentifierExtractor: func(ctx echo.Context) (string, error) {
-			id := ctx.RealIP()
-			return id, nil
-		},
-		ErrorHandler: func(context echo.Context, err error) error {
-			return context.JSON(http.StatusTooManyRequests, map[string]interface{}{
-				"error":   "rate_limit_exceeded",
-				"message": "Too many requests. Please try again later.",
-			})
-		},
-		DenyHandler: func(context echo.Context, identifier string, err error) error {
-			return context.JSON(http.StatusTooManyRequests, map[string]interface{}{
-				"error":   "rate_limit_exceeded",
-				"message": "Too many requests. Please try again later.",
-			})
-		},
-	}
-	s.e.Use(middleware.RateLimiterWithConfig(rateLimiterConfig))
+	s.echo.Use(middleware.RateLimiter(middleware.NewRateLimiterMemoryStore(100)))
 
-	// Static files
-	s.e.Static("/static", "./static")
-	s.e.File("/favicon.ico", "./static/favicon.ico")
+	// Health checks (public)
+	s.echo.GET("/health", s.handlers.Health.HealthCheck)
+	s.echo.GET("/ready", s.handlers.Health.ReadinessCheck)
 
-	// API Routes
-	s.setupRoutes()
+	// API v1 routes
+	api := s.echo.Group("/api/v1")
 
-	return nil
-}
-
-// setupRoutes configures all API routes
-func (s *Server) setupRoutes() {
-	api := s.e.Group("/api/v1")
-
-	// Public routes
-	public := api.Group("")
+	// Auth routes (public)
+	authGroup := api.Group("/auth")
 	{
-		// Health check
-		public.GET("/health", s.handlers.Health.HealthCheck)
-		public.GET("/ready", s.handlers.Health.ReadinessCheck)
-
-		// Authentication
-		public.POST("/auth/register", s.handlers.Auth.Register)
-		public.POST("/auth/login", s.handlers.Auth.Login)
-		public.POST("/auth/refresh", s.handlers.Auth.RefreshToken)
-		public.POST("/auth/verify-email", s.handlers.Auth.VerifyEmail)
-		public.POST("/auth/resend-verification", s.handlers.Auth.ResendVerification)
-		public.POST("/auth/reset-password", s.handlers.Auth.ResetPassword)
-		public.POST("/auth/verify-reset", s.handlers.Auth.VerifyReset)
-		public.GET("/auth/check-reset-token", s.handlers.Auth.CheckResetToken)
-
-		// Public info
-		public.GET("/networks/status", s.handlers.Network.GetStatus)
-		public.GET("/email/validate", s.handlers.Email.ValidateEmail)
-		public.GET("/email/check-domain", s.handlers.Email.CheckDomainAvailability)
-		public.GET("/email/domain/:domain/config", s.handlers.Email.GetDomainConfig)
+		authGroup.POST("/register", s.handlers.Auth.Register)
+		authGroup.POST("/login", s.handlers.Auth.Login)
+		authGroup.POST("/logout", s.handlers.Auth.Logout)
+		authGroup.POST("/refresh", s.handlers.Auth.RefreshToken)
+		authGroup.POST("/verify-email", s.handlers.Auth.VerifyEmail)
+		authGroup.POST("/resend-verification", s.handlers.Auth.ResendVerification)
+		authGroup.POST("/reset-password", s.handlers.Auth.ResetPassword)
+		authGroup.POST("/verify-reset", s.handlers.Auth.VerifyReset)
+		authGroup.GET("/check-reset-token", s.handlers.Auth.CheckResetToken)
 	}
 
 	// Protected routes (require authentication)
 	protected := api.Group("")
-	protected.Use(middleware.JWTWithConfig(s.handlers.Auth.getJWTConfig()))
+	protected.Use(middleware.JWTAuth(s.jwtService))
 	{
-		// User management
-		protected.GET("/users/me", s.handlers.User.GetProfile)
-		protected.PUT("/users/me", s.handlers.User.UpdateProfile)
-		protected.GET("/users/me/settings", s.handlers.User.GetSettings)
-		protected.PUT("/users/me/settings", s.handlers.User.UpdateSettings)
-		protected.GET("/users/me/storage", s.handlers.User.GetStorageUsage)
-		protected.GET("/users/me/sessions", s.handlers.User.GetSessions)
-		protected.DELETE("/users/me/sessions/:sessionId", s.handlers.User.RevokeSession)
-		protected.DELETE("/users/me/sessions", s.handlers.User.RevokeAllSessions)
+		// User profile
+		protected.GET("/profile", s.handlers.User.GetProfile)
+		protected.PUT("/profile", s.handlers.User.UpdateProfile)
+		protected.GET("/settings", s.handlers.User.GetSettings)
+		protected.PUT("/settings", s.handlers.User.UpdateSettings)
+		protected.GET("/storage", s.handlers.User.GetStorageUsage)
+		protected.GET("/sessions", s.handlers.User.GetSessions)
+		protected.DELETE("/sessions/:sessionId", s.handlers.User.RevokeSession)
+		protected.DELETE("/sessions", s.handlers.User.RevokeAllSessions)
 
 		// MFA
-		protected.GET("/users/me/mfa/setup", s.handlers.Auth.GetMFASetup)
-		protected.POST("/users/me/mfa/verify", s.handlers.Auth.VerifyMFASetup)
-		protected.POST("/users/me/mfa/disable", s.handlers.Auth.DisableMFA)
-		protected.GET("/users/me/mfa/recovery-codes", s.handlers.Auth.GetRecoveryCodes)
+		protected.GET("/mfa/setup", s.handlers.Auth.GetMFASetup)
+		protected.POST("/mfa/verify", s.handlers.Auth.VerifyMFASetup)
+		protected.POST("/mfa/disable", s.handlers.Auth.DisableMFA)
+		protected.GET("/mfa/recovery-codes", s.handlers.Auth.GetRecoveryCodes)
 
-		// Email management
+		// Emails
 		protected.GET("/emails", s.handlers.Email.ListEmails)
 		protected.GET("/emails/search", s.handlers.Email.SearchEmails)
 		protected.POST("/emails", s.handlers.Email.SendEmail)
@@ -180,30 +118,14 @@ func (s *Server) setupRoutes() {
 		protected.PUT("/emails/:id/starred", s.handlers.Email.MarkAsStarred)
 		protected.PUT("/emails/:id/folder", s.handlers.Email.MoveToFolder)
 		protected.DELETE("/emails/:id", s.handlers.Email.DeleteEmail)
-		protected.GET("/emails/thread/:threadId", s.handlers.Email.GetThread)
-
-		// Network identities
-		protected.GET("/networks/identities", s.handlers.Network.GetIdentities)
-		protected.POST("/networks/identities", s.handlers.Network.CreateIdentity)
-		protected.PUT("/networks/identities/:id", s.handlers.Network.UpdateIdentity)
-		protected.DELETE("/networks/identities/:id", s.handlers.Network.DeleteIdentity)
-		protected.POST("/networks/identities/:id/test", s.handlers.Network.TestIdentityConnection)
-
-		// Contacts
-		protected.GET("/contacts", s.handlers.Contact.ListContacts)
-		protected.POST("/contacts", s.handlers.Contact.CreateContact)
-		protected.PUT("/contacts/:id", s.handlers.Contact.UpdateContact)
-		protected.DELETE("/contacts/:id", s.handlers.Contact.DeleteContact)
-		protected.GET("/contacts/search", s.handlers.Contact.SearchContacts)
-		protected.POST("/contacts/import", s.handlers.Contact.ImportContacts)
-		protected.GET("/contacts/export", s.handlers.Contact.ExportContacts)
+		protected.GET("/threads/:threadId", s.handlers.Email.GetThread)
 
 		// Folders
 		protected.GET("/folders", s.handlers.Folder.ListFolders)
 		protected.POST("/folders", s.handlers.Folder.CreateFolder)
+		protected.GET("/folders/:id", s.handlers.Folder.GetFolderEmails)
 		protected.PUT("/folders/:id", s.handlers.Folder.UpdateFolder)
 		protected.DELETE("/folders/:id", s.handlers.Folder.DeleteFolder)
-		protected.GET("/folders/:id/emails", s.handlers.Folder.GetFolderEmails)
 
 		// Labels
 		protected.GET("/labels", s.handlers.Label.ListLabels)
@@ -213,13 +135,23 @@ func (s *Server) setupRoutes() {
 		protected.POST("/emails/:emailId/labels/:labelId", s.handlers.Label.ApplyLabelToEmail)
 		protected.DELETE("/emails/:emailId/labels/:labelId", s.handlers.Label.RemoveLabelFromEmail)
 
-		// Encryption keys
-		protected.GET("/keys", s.handlers.Encryption.GetKeys)
-		protected.POST("/keys", s.handlers.Encryption.GenerateKey)
-		protected.DELETE("/keys/:id", s.handlers.Encryption.DeleteKey)
-		protected.POST("/keys/:id/rotate", s.handlers.Encryption.RotateKey)
-		protected.POST("/keys/test", s.handlers.Encryption.TestEncryption)
-		protected.GET("/keys/:id", s.handlers.Encryption.GetKeyInfo)
+		// Contacts
+		protected.GET("/contacts", s.handlers.Contact.ListContacts)
+		protected.POST("/contacts", s.handlers.Contact.CreateContact)
+		protected.GET("/contacts/search", s.handlers.Contact.SearchContacts)
+		protected.GET("/contacts/:id", s.handlers.Contact.GetEmail) // Note: GetEmail handles both emails and contacts
+		protected.PUT("/contacts/:id", s.handlers.Contact.UpdateContact)
+		protected.DELETE("/contacts/:id", s.handlers.Contact.DeleteContact)
+		protected.POST("/contacts/import", s.handlers.Contact.ImportContacts)
+		protected.GET("/contacts/export", s.handlers.Contact.ExportContacts)
+
+		// Network identities
+		protected.GET("/networks/status", s.handlers.Network.GetStatus)
+		protected.GET("/networks/identities", s.handlers.Network.GetIdentities)
+		protected.POST("/networks/identities", s.handlers.Network.CreateIdentity)
+		protected.PUT("/networks/identities/:id", s.handlers.Network.UpdateIdentity)
+		protected.DELETE("/networks/identities/:id", s.handlers.Network.DeleteIdentity)
+		protected.POST("/networks/identities/:id/test", s.handlers.Network.TestIdentityConnection)
 
 		// Provider bridges
 		protected.GET("/providers", s.handlers.Provider.ListProviders)
@@ -229,13 +161,27 @@ func (s *Server) setupRoutes() {
 		protected.POST("/providers/:id/sync", s.handlers.Provider.SyncProvider)
 		protected.GET("/providers/:id/status", s.handlers.Provider.GetProviderStatus)
 
+		// Encryption keys
+		protected.GET("/keys", s.handlers.Encryption.GetKeys)
+		protected.POST("/keys", s.handlers.Encryption.GenerateKey)
+		protected.GET("/keys/:id", s.handlers.Encryption.GetKeyInfo)
+		protected.DELETE("/keys/:id", s.handlers.Encryption.DeleteKey)
+		protected.POST("/keys/:id/rotate", s.handlers.Encryption.RotateKey)
+		protected.POST("/keys/test", s.handlers.Encryption.TestEncryption)
+
 		// WebSocket
 		protected.GET("/ws", s.handlers.WebSocket.HandleWebSocket)
+
+		// Email validation
+		protected.GET("/email/validate", s.handlers.Email.ValidateEmail)
+		protected.GET("/domain/check", s.handlers.Email.CheckDomainAvailability)
+		protected.GET("/domain/:domain/config", s.handlers.Email.GetDomainConfig)
 	}
 
 	// Admin routes (require admin privileges)
 	admin := api.Group("/admin")
-	admin.Use(middleware.AdminAuth(s.handlers.Auth.authService))
+	admin.Use(middleware.JWTAuth(s.jwtService))
+	admin.Use(middleware.AdminAuth())
 	{
 		admin.GET("/users", s.handlers.Admin.ListUsers)
 		admin.GET("/users/:id", s.handlers.Admin.GetUser)
@@ -245,172 +191,130 @@ func (s *Server) setupRoutes() {
 		admin.GET("/logs", s.handlers.Admin.GetLogs)
 		admin.POST("/cleanup", s.handlers.Admin.Cleanup)
 	}
+
+	// Static files (for web interface)
+	s.echo.Static("/static", "./static")
+	s.echo.File("/", "./static/index.html")
+	s.echo.File("/favicon.ico", "./static/favicon.ico")
+
+	// 404 handler
+	s.echo.HTTPErrorHandler = s.customHTTPErrorHandler
+
+	return nil
 }
 
 // Start starts the HTTP server
 func (s *Server) Start() error {
-	s.isRunning = true
+	address := fmt.Sprintf("%s:%d", s.cfg.Server.Host, s.cfg.Server.Port)
+	s.logger.Info("Starting HTTP server", zap.String("address", address))
 
-	// Set the Echo instance to use our HTTP server
-	s.e.Server = s.server
-
-	s.logger.Info("Starting server",
-		zap.String("address", s.server.Addr),
-		zap.Bool("tls", s.cfg.Server.TLSEnabled))
+	s.httpServer = &http.Server{
+		Addr:         address,
+		Handler:      s.echo,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
 
 	if s.cfg.Server.TLSEnabled {
-		return s.e.StartTLS(
-			s.server.Addr,
+		s.logger.Info("Starting HTTPS server with TLS")
+		return s.httpServer.ListenAndServeTLS(
 			s.cfg.Server.TLSCertPath,
 			s.cfg.Server.TLSKeyPath,
 		)
 	}
 
-	return s.e.Start(s.server.Addr)
+	s.logger.Info("Starting HTTP server (no TLS)")
+	return s.httpServer.ListenAndServe()
 }
 
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.isRunning = false
-	return s.e.Shutdown(ctx)
+	s.logger.Info("Shutting down HTTP server")
+
+	if s.httpServer != nil {
+		return s.httpServer.Shutdown(ctx)
+	}
+
+	return nil
 }
 
-// IsRunning returns true if the server is running
-func (s *Server) IsRunning() bool {
-	return s.isRunning
+// loggingMiddleware provides request logging
+func (s *Server) loggingMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			start := time.Now()
+
+			// Process request
+			err := next(c)
+
+			// Log request
+			req := c.Request()
+			res := c.Response()
+
+			latency := time.Since(start)
+
+			fields := []zap.Field{
+				zap.String("method", req.Method),
+				zap.String("uri", req.RequestURI),
+				zap.String("ip", c.RealIP()),
+				zap.Int("status", res.Status),
+				zap.Duration("latency", latency),
+				zap.String("user_agent", req.UserAgent()),
+			}
+
+			if err != nil {
+				fields = append(fields, zap.Error(err))
+			}
+
+			// Log at appropriate level based on status code
+			switch {
+			case res.Status >= 500:
+				s.logger.Error("Server error", fields...)
+			case res.Status >= 400:
+				s.logger.Warn("Client error", fields...)
+			default:
+				s.logger.Info("Request processed", fields...)
+			}
+
+			return err
+		}
+	}
 }
 
-// GetEcho returns the Echo instance
-func (s *Server) GetEcho() *echo.Echo {
-	return s.e
-}
+// customHTTPErrorHandler provides custom error responses
+func (s *Server) customHTTPErrorHandler(err error, c echo.Context) {
+	code := http.StatusInternalServerError
+	message := "Internal Server Error"
 
-// newEchoLogger creates a zap logger adapter for Echo
-func newEchoLogger(logger *zap.Logger) *echoLogger {
-	return &echoLogger{logger: logger}
-}
+	if he, ok := err.(*echo.HTTPError); ok {
+		code = he.Code
+		message = fmt.Sprintf("%v", he.Message)
+		if he.Internal != nil {
+			s.logger.Error("HTTP error with internal error",
+				zap.Int("code", code),
+				zap.String("message", message),
+				zap.Error(he.Internal))
+		}
+	} else {
+		s.logger.Error("Unhandled error", zap.Error(err))
+	}
 
-type echoLogger struct {
-	logger *zap.Logger
-}
+	// Don't send error details in production for 5xx errors
+	if code >= 500 && s.cfg.Server.Host != "localhost" {
+		message = "Internal Server Error"
+	}
 
-func (l *echoLogger) Write(p []byte) (n int, err error) {
-	msg := strings.TrimSpace(string(p))
-	l.logger.Info(msg)
-	return len(p), nil
-}
+	// JSON response for API routes
+	if strings.HasPrefix(c.Request().URL.Path, "/api/") {
+		c.JSON(code, map[string]interface{}{
+			"error":   http.StatusText(code),
+			"message": message,
+			"code":    code,
+		})
+		return
+	}
 
-func (l *echoLogger) Print(i ...interface{}) {
-	l.logger.Info(fmt.Sprint(i...))
-}
-
-func (l *echoLogger) Printf(format string, args ...interface{}) {
-	l.logger.Info(fmt.Sprintf(format, args...))
-}
-
-func (l *echoLogger) Printj(j middleware.JSON) {
-	l.logger.Info("", zap.Any("data", j))
-}
-
-func (l *echoLogger) Debug(i ...interface{}) {
-	l.logger.Debug(fmt.Sprint(i...))
-}
-
-func (l *echoLogger) Debugf(format string, args ...interface{}) {
-	l.logger.Debug(fmt.Sprintf(format, args...))
-}
-
-func (l *echoLogger) Debugj(j middleware.JSON) {
-	l.logger.Debug("", zap.Any("data", j))
-}
-
-func (l *echoLogger) Info(i ...interface{}) {
-	l.logger.Info(fmt.Sprint(i...))
-}
-
-func (l *echoLogger) Infof(format string, args ...interface{}) {
-	l.logger.Info(fmt.Sprintf(format, args...))
-}
-
-func (l *echoLogger) Infoj(j middleware.JSON) {
-	l.logger.Info("", zap.Any("data", j))
-}
-
-func (l *echoLogger) Warn(i ...interface{}) {
-	l.logger.Warn(fmt.Sprint(i...))
-}
-
-func (l *echoLogger) Warnf(format string, args ...interface{}) {
-	l.logger.Warn(fmt.Sprintf(format, args...))
-}
-
-func (l *echoLogger) Warnj(j middleware.JSON) {
-	l.logger.Warn("", zap.Any("data", j))
-}
-
-func (l *echoLogger) Error(i ...interface{}) {
-	l.logger.Error(fmt.Sprint(i...))
-}
-
-func (l *echoLogger) Errorf(format string, args ...interface{}) {
-	l.logger.Error(fmt.Sprintf(format, args...))
-}
-
-func (l *echoLogger) Errorj(j middleware.JSON) {
-	l.logger.Error("", zap.Any("data", j))
-}
-
-func (l *echoLogger) Fatal(i ...interface{}) {
-	l.logger.Fatal(fmt.Sprint(i...))
-	os.Exit(1)
-}
-
-func (l *echoLogger) Fatalf(format string, args ...interface{}) {
-	l.logger.Fatal(fmt.Sprintf(format, args...))
-	os.Exit(1)
-}
-
-func (l *echoLogger) Fatalj(j middleware.JSON) {
-	l.logger.Fatal("", zap.Any("data", j))
-	os.Exit(1)
-}
-
-func (l *echoLogger) Panic(i ...interface{}) {
-	l.logger.Panic(fmt.Sprint(i...))
-}
-
-func (l *echoLogger) Panicf(format string, args ...interface{}) {
-	l.logger.Panic(fmt.Sprintf(format, args...))
-}
-
-func (l *echoLogger) Panicj(j middleware.JSON) {
-	l.logger.Panic("", zap.Any("data", j))
-}
-
-func (l *echoLogger) SetLevel(level echolog.Lvl) {
-	// Not implemented - zap handles levels differently
-}
-
-func (l *echoLogger) Level() echolog.Lvl {
-	return echolog.INFO
-}
-
-func (l *echoLogger) SetHeader(h string) {
-	// Not implemented
-}
-
-func (l *echoLogger) Prefix() string {
-	return ""
-}
-
-func (l *echoLogger) SetPrefix(p string) {
-	// Not implemented
-}
-
-func (l *echoLogger) Output() io.Writer {
-	return l
-}
-
-func (l *echoLogger) SetOutput(w io.Writer) {
-	// Not implemented
+	// HTML response for web routes
+	c.String(code, message)
 }

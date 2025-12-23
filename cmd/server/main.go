@@ -2,232 +2,234 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/okavatti/mxil-server/m/internal/api"
+	"github.com/jmoiron/sqlx"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	_ "github.com/lib/pq"
+	"go.uber.org/zap"
+
 	"github.com/okavatti/mxil-server/m/internal/api/handlers"
 	"github.com/okavatti/mxil-server/m/internal/auth"
 	"github.com/okavatti/mxil-server/m/internal/config"
-	"github.com/okavatti/mxil-server/m/internal/crypto"
-	"github.com/okavatti/mxil-server/m/internal/database"
 	"github.com/okavatti/mxil-server/m/internal/email"
-	"github.com/okavatti/mxil-server/m/internal/models"
-	"github.com/okavatti/mxil-server/m/internal/network/clearnet"
-	"github.com/okavatti/mxil-server/m/internal/network/i2p"
+	"github.com/okavatti/mxil-server/m/internal/migrations"
 	"github.com/okavatti/mxil-server/m/internal/repository"
 	"github.com/okavatti/mxil-server/m/internal/service"
-	"github.com/okavatti/mxil-server/m/internal/storage"
-
-	"go.uber.org/zap"
 )
 
 func main() {
-	// Load configuration
-	cfg, err := config.Load()
-	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
-	}
-
 	// Initialize logger
-	var logger *zap.Logger
-	if cfg.Logging.Format == "json" {
-		logger, err = zap.NewProduction()
-	} else {
-		logger, err = zap.NewDevelopment()
-	}
+	logger, err := zap.NewProduction()
 	if err != nil {
-		log.Fatalf("Failed to initialize logger: %v", err)
+		log.Fatal("Failed to initialize logger:", err)
 	}
 	defer logger.Sync()
 
-	logger.Info("Starting MXIL Server",
-		zap.String("version", "1.0.0"),
-		zap.String("environment", os.Getenv("ENVIRONMENT")),
-	)
+	logger.Info("Starting MXIL Server...")
 
-	// Connect to database
-	db, err := database.NewDatabase(&cfg.Database)
+	// Load configuration
+	cfg, err := config.Load()
 	if err != nil {
-		logger.Fatal("Failed to connect to database", zap.Error(err))
+		logger.Fatal("Failed to load configuration", zap.Error(err))
 	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			logger.Error("Failed to close database", zap.Error(err))
+
+	// Initialize database
+	db, err := initDatabase(cfg.Database, logger)
+	if err != nil {
+		logger.Fatal("Failed to initialize database", zap.Error(err))
+	}
+	defer db.Close()
+
+	// Run migrations
+	if err := runMigrations(db, logger); err != nil {
+		logger.Fatal("Failed to run migrations", zap.Error(err))
+	}
+
+	// Initialize services
+	services, err := initServices(db, cfg, logger)
+	if err != nil {
+		logger.Fatal("Failed to initialize services", zap.Error(err))
+	}
+
+	// Initialize HTTP server
+	e := initHTTPServer(services, cfg, logger)
+
+	// Start server
+	go func() {
+		addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
+		logger.Info("Starting HTTP server", zap.String("address", addr))
+		if err := e.Start(addr); err != nil && err != http.ErrServerClosed {
+			logger.Fatal("Server failed", zap.Error(err))
 		}
 	}()
 
-	// Run migrations
-	logger.Info("Running database migrations...")
-	if err := db.Migrate(); err != nil {
-		logger.Fatal("Failed to run migrations", zap.Error(err))
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	logger.Info("Shutting down server...")
+
+	// Graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := e.Shutdown(ctx); err != nil {
+		logger.Fatal("Server forced to shutdown", zap.Error(err))
 	}
-	logger.Info("Database migrations completed")
 
-	// Initialize repositories
-	userRepo := repository.NewUserRepository(db.DB)
-	emailRepo := repository.NewEmailRepository(db.DB)
-	sessionRepo := repository.NewSessionRepository(db.DB)
+	logger.Info("Server exited properly")
+}
 
-	// Initialize crypto service
-	cryptoService, err := crypto.NewCryptoService(string(cfg.Security.EncryptionKey))
+func initDatabase(dbConfig config.DatabaseConfig, logger *zap.Logger) (*sqlx.DB, error) {
+	connStr := fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		dbConfig.Host,
+		dbConfig.Port,
+		dbConfig.User,
+		dbConfig.Password,
+		dbConfig.Database,
+		dbConfig.SSLMode,
+	)
+
+	db, err := sqlx.Connect("postgres", connStr)
 	if err != nil {
-		logger.Fatal("Failed to initialize crypto service", zap.Error(err))
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
+
+	// Configure connection pool
+	db.SetMaxOpenConns(dbConfig.MaxOpenConns)
+	db.SetMaxIdleConns(dbConfig.MaxIdleConns)
+	db.SetConnMaxLifetime(dbConfig.ConnMaxLifetime)
+
+	// Test connection
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	logger.Info("Database connection established")
+	return db, nil
+}
+
+func runMigrations(db *sqlx.DB, logger *zap.Logger) error {
+	migrationManager := migrations.NewMigrationManager(db)
+	return migrationManager.Run()
+}
+
+func initServices(db *sqlx.DB, cfg *config.Config, logger *zap.Logger) (*service.Services, error) {
+	// Initialize repositories
+	repos := repository.NewRepositories(db, logger)
 
 	// Initialize JWT service
-	jwtService := auth.NewJWTService(cfg.Security.JWTSecret, cfg.Security.JWTExpiration)
+	jwtService := auth.NewJWTService([]byte(cfg.Security.JWTSecret), cfg.Security.JWTExpiration)
 
-	// Initialize storage service
-	storageService, err := storage.NewLocalStorage(cfg.Storage.LocalPath, cfg.Storage.MaxFileSize)
-	if err != nil {
-		logger.Fatal("Failed to initialize storage service", zap.Error(err))
-	}
-
-	// Initialize email components
-	emailParser := email.NewEmailParser()
-	emailPipeline := email.NewPipeline([]email.PipelineStage{
-		&email.SpamFilterStage{},
-		&email.VirusScanStage{},
-		&email.DKIMVerificationStage{},
-	})
-
-	// Initialize network adapters
-	adapters := make(map[models.NetworkType]service.NetworkAdapter)
-
-	// Clearnet adapter
-	clearnetAdapter := clearnet.NewClearnetAdapter(
-		"localhost",
-		cfg.Email.SMTPPort,
-		"", "", // SMTP credentials (should be configured)
-		"localhost",
-		cfg.Email.IMAPPort,
-	)
-	adapters[models.NetworkClearnet] = clearnetAdapter
-
-	// I2P adapter (if enabled)
-	if cfg.Network.EnableI2P {
-		logger.Info("Initializing I2P network adapter...")
-		i2pAdapter := i2p.NewI2PAdapter("127.0.0.1:7656")
-		adapters[models.NetworkI2P] = i2pAdapter
-
-		// Test I2P connection
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		if err := i2pAdapter.Connect(ctx); err != nil {
-			logger.Warn("Failed to connect to I2P network", zap.Error(err))
-		} else {
-			logger.Info("I2P network adapter initialized successfully")
-		}
-	}
-
-	// Initialize network service
-	networkService := service.NewNetworkService(adapters)
+	// Initialize crypto service
+	cryptoService := service.NewCryptoService(cfg.Security.EncryptionKey)
 
 	// Initialize email service
-	emailService := service.NewEmailService(
-		emailRepo,
-		userRepo,
-		emailParser,
-		emailPipeline,
-		storageService,
-		networkService,
+	emailService := email.NewService(
+		repos.Email,
+		repos.User,
+		email.NewParser(),
+		email.NewPipeline(),
+		service.NewStorageService(cfg.Storage),
 		cryptoService,
-		logger,
 	)
 
 	// Initialize auth service
 	authService := service.NewAuthService(
-		userRepo,
-		sessionRepo,
-		emailRepo,
+		repos.User,
+		repos.Session,
 		jwtService,
 		cryptoService,
-		emailService,
-		cfg.Security.LockoutDuration,
-		cfg.Security.MaxLoginAttempts,
+		cfg.Security,
 	)
 
-	// Initialize handlers
-	handler := handlers.NewHandlers(
-		authService,
-		emailService,
-		userRepo,
-		emailRepo,
-		sessionRepo,
-		logger,
-	)
+	// Initialize network service
+	networkService := service.NewNetworkService(cfg.Network)
 
-	// Set database in health handler
-	handler.Health.db = db
-
-	// Create API server
-	server := api.NewServer(cfg, logger, handler)
-
-	// Setup routes
-	logger.Info("Setting up API routes...")
-	if err := server.Setup(); err != nil {
-		logger.Fatal("Failed to setup server", zap.Error(err))
-	}
-
-	// Start server in goroutine
-	go func() {
-		logger.Info("Starting HTTP server",
-			zap.String("host", cfg.Server.Host),
-			zap.Int("port", cfg.Server.Port),
-			zap.Bool("tls", cfg.Server.TLSEnabled),
-		)
-
-		if err := server.Start(); err != nil {
-			logger.Fatal("Failed to start server", zap.Error(err))
-		}
-	}()
-
-	// Start background services
-	go startBackgroundServices(logger, storageService)
-
-	// Wait for interrupt signal
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
-	sig := <-quit
-
-	logger.Info("Shutting down server...", zap.String("signal", sig.String()))
-
-	// Create shutdown context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Shutdown server
-	if err := server.Shutdown(ctx); err != nil {
-		logger.Fatal("Failed to shutdown server gracefully", zap.Error(err))
-	}
-
-	logger.Info("Server stopped")
+	return &service.Services{
+		Auth:    authService,
+		Email:   emailService,
+		Crypto:  cryptoService,
+		Network: networkService,
+	}, nil
 }
 
-// startBackgroundServices starts background maintenance tasks
-func startBackgroundServices(logger *zap.Logger, storageService service.StorageService) {
-	// Cleanup temporary files every hour
-	ticker := time.NewTicker(1 * time.Hour)
-	defer ticker.Stop()
+func initHTTPServer(services *service.Services, cfg *config.Config, logger *zap.Logger) *echo.Echo {
+	e := echo.New()
 
-	for range ticker.C {
-		ctx := context.Background()
+	// Middleware
+	e.Use(middleware.Logger())
+	e.Use(middleware.Recover())
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete},
+	}))
 
-		// Cleanup temp files older than 24 hours
-		if err := storageService.CleanupTempFiles(ctx, 24*time.Hour); err != nil {
-			logger.Error("Failed to cleanup temp files", zap.Error(err))
-		}
+	// Initialize handlers
+	h := handlers.NewHandlers(services, logger)
 
-		// Log storage statistics daily
-		if time.Now().Hour() == 0 {
-			if stats, err := storageService.GetStats(ctx); err == nil {
-				logger.Info("Storage statistics", zap.Any("stats", stats))
-			}
-		}
-	}
+	// Routes
+	api := e.Group("/api/v1")
+
+	// Public routes
+	api.POST("/auth/register", h.Auth.Register)
+	api.POST("/auth/login", h.Auth.Login)
+	api.POST("/auth/refresh", h.Auth.RefreshToken)
+	api.POST("/auth/reset-password", h.Auth.ResetPassword)
+	api.POST("/auth/verify-email", h.Auth.VerifyEmail)
+
+	// Protected routes (require auth)
+	protected := api.Group("")
+	protected.Use(h.AuthMiddleware())
+
+	protected.GET("/profile", h.User.GetProfile)
+	protected.PUT("/profile", h.User.UpdateProfile)
+
+	protected.GET("/emails", h.Email.ListEmails)
+	protected.GET("/emails/:id", h.Email.GetEmail)
+	protected.POST("/emails", h.Email.SendEmail)
+	protected.PUT("/emails/:id/read", h.Email.MarkAsRead)
+	protected.PUT("/emails/:id/starred", h.Email.MarkAsStarred)
+	protected.DELETE("/emails/:id", h.Email.DeleteEmail)
+
+	protected.GET("/contacts", h.Contact.ListContacts)
+	protected.POST("/contacts", h.Contact.CreateContact)
+	protected.PUT("/contacts/:id", h.Contact.UpdateContact)
+	protected.DELETE("/contacts/:id", h.Contact.DeleteContact)
+
+	protected.GET("/folders", h.Folder.ListFolders)
+	protected.POST("/folders", h.Folder.CreateFolder)
+	protected.GET("/folders/:id/emails", h.Folder.GetFolderEmails)
+
+	protected.GET("/network/status", h.Network.GetStatus)
+	protected.GET("/network/identities", h.Network.GetIdentities)
+	protected.POST("/network/identities", h.Network.CreateIdentity)
+
+	// Admin routes
+	admin := protected.Group("/admin")
+	admin.Use(h.AdminMiddleware())
+	admin.GET("/users", h.Admin.ListUsers)
+	admin.GET("/stats", h.Admin.GetStats)
+
+	// Health check
+	e.GET("/health", h.Health.HealthCheck)
+	e.GET("/ready", h.Health.ReadinessCheck)
+
+	// WebSocket
+	e.GET("/ws", h.WebSocket.HandleWebSocket)
+
+	return e
 }

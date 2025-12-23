@@ -42,18 +42,32 @@ func NewHandlers(
 	statsRepo *repository.StatsRepository,
 	logger *zap.Logger,
 ) *Handlers {
+	// Initialize individual handlers
+	authHandler := NewAuthHandler(authService, logger)
+	emailHandler := NewEmailHandler(emailService, emailRepo, userRepo, logger)
+	userHandler := NewUserHandler(userRepo, sessionRepo, authService, logger)
+	folderHandler := NewFolderHandler(folderRepo, emailRepo, logger)
+	labelHandler := NewLabelHandler(labelRepo, emailRepo, logger)
+	contactHandler := NewContactHandler(contactRepo, logger)
+	networkHandler := NewNetworkHandler(networkService, networkRepo, logger)
+	providerHandler := NewProviderHandler(providerRepo, logger)
+	encryptionHandler := NewEncryptionHandler(cryptoService, keyRepo, logger)
+	adminHandler := NewAdminHandler(userRepo, emailRepo, networkRepo, statsRepo, logger)
+	webSocketHandler := NewWebSocketHandler(authService, emailService, logger)
+	healthHandler := &HealthHandler{}
+
 	return &Handlers{
-		Auth:       NewAuthHandler(authService, logger),
-		Email:      NewEmailHandler(emailService, emailRepo, userRepo, logger),
-		User:       NewUserHandler(userRepo, sessionRepo, authService, logger),
-		Folder:     NewFolderHandler(folderRepo, emailRepo, logger),
-		Label:      NewLabelHandler(labelRepo, emailRepo, logger),
-		Contact:    NewContactHandler(contactRepo, logger),
-		Network:    NewNetworkHandler(networkService, networkRepo, logger),
-		Provider:   NewProviderHandler(providerRepo, logger),
-		Encryption: NewEncryptionHandler(cryptoService, keyRepo, logger),
-		Admin:      NewAdminHandler(userRepo, emailRepo, networkRepo, statsRepo, logger),
-		WebSocket:  NewWebSocketHandler(authService, emailService, logger),
-		Health:     &HealthHandler{},
+		Auth:       authHandler,
+		Email:      emailHandler,
+		User:       userHandler,
+		Folder:     folderHandler,
+		Label:      labelHandler,
+		Contact:    contactHandler,
+		Network:    networkHandler,
+		Provider:   providerHandler,
+		Encryption: encryptionHandler,
+		Admin:      adminHandler,
+		WebSocket:  webSocketHandler,
+		Health:     healthHandler,
 	}
 }

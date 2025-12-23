@@ -14,6 +14,11 @@ type HealthHandler struct {
 	db *database.DB
 }
 
+// SetDatabase sets the database for the health handler
+func (h *HealthHandler) SetDatabase(db *database.DB) {
+	h.db = db
+}
+
 // HealthCheck performs a basic health check
 func (h *HealthHandler) HealthCheck(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]interface{}{

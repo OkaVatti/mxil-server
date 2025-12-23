@@ -6,10 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -19,81 +16,6 @@ var (
 	// ErrExpiredToken indicates an expired token
 	ErrExpiredToken = errors.New("expired token")
 )
-
-// JWTService handles JWT token creation and validation
-type JWTService struct {
-	secret     []byte
-	expiration time.Duration
-}
-
-// NewJWTService creates a new JWT service
-func NewJWTService(secret string, expiration time.Duration) *JWTService {
-	return &JWTService{
-		secret:     []byte(secret),
-		expiration: expiration,
-	}
-}
-
-// Claims represents JWT claims
-type Claims struct {
-	UserID    uuid.UUID `json:"user_id"`
-	Username  string    `json:"username"`
-	SessionID uuid.UUID `json:"session_id"`
-	jwt.RegisteredClaims
-}
-
-// GenerateToken generates a new JWT token for a user
-func (s *JWTService) GenerateToken(userID uuid.UUID, username string, sessionID uuid.UUID) (string, error) {
-	expirationTime := time.Now().Add(s.expiration)
-
-	claims := &Claims{
-		UserID:    userID,
-		Username:  username,
-		SessionID: sessionID,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(expirationTime),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			NotBefore: jwt.NewNumericDate(time.Now()),
-			Issuer:    "mxil-server",
-		},
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString(s.secret)
-}
-
-// ValidateToken validates a JWT token
-func (s *JWTService) ValidateToken(tokenString string) (*Claims, error) {
-	// Parse the token
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
-		// Validate the signing method
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return s.secret, nil
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	// Validate claims
-	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
-		return claims, nil
-	}
-
-	return nil, ErrInvalidToken
-}
-
-// RefreshToken refreshes a JWT token
-func (s *JWTService) RefreshToken(tokenString string) (string, error) {
-	claims, err := s.ValidateToken(tokenString)
-	if err != nil {
-		return "", err
-	}
-
-	return s.GenerateToken(claims.UserID, claims.Username, claims.SessionID)
-}
 
 // HashPassword hashes a password using bcrypt
 func HashPassword(password string) (string, error) {

@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
@@ -133,7 +134,7 @@ func (h *LabelHandler) CreateLabel(c echo.Context) error {
 		label.Color = generateRandomColor()
 	}
 
-	ctx := c.Request().Context()
+	// Fixed: Removed duplicate ctx declaration
 	if err := h.labelRepo.Create(ctx, label); err != nil {
 		h.logger.Error("Failed to create label", zap.Error(err))
 		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
@@ -335,6 +336,9 @@ func isValidHexColor(color string) bool {
 }
 
 func generateRandomColor() string {
+	// Seed random number generator
+	rand.Seed(time.Now().UnixNano())
+
 	colors := []string{
 		"#6d4aff", "#4a90e2", "#50e3c2", "#f5a623",
 		"#7ed321", "#bd10e0", "#ff0080", "#b8e986",

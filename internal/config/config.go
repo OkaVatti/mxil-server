@@ -11,127 +11,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Config represents the application configuration
-type Config struct {
-	Server   ServerConfig
-	Database DatabaseConfig
-	Security SecurityConfig
-	Email    EmailConfig
-	Network  NetworkConfig
-	Storage  StorageConfig
-	Logging  LoggingConfig
-}
-
-// ServerConfig represents server configuration
-type ServerConfig struct {
-	Host         string
-	Port         int
-	ReadTimeout  time.Duration
-	WriteTimeout time.Duration
-	TLSEnabled   bool
-	TLSCertPath  string
-	TLSKeyPath   string
-}
-
-// DatabaseConfig represents database configuration
-type DatabaseConfig struct {
-	Host            string
-	Port            int
-	User            string
-	Password        string
-	Database        string
-	SSLMode         string
-	MaxOpenConns    int
-	MaxIdleConns    int
-	ConnMaxLifetime time.Duration
-}
-
-// SecurityConfig represents security configuration
-type SecurityConfig struct {
-	JWTSecret             string
-	JWTExpiration         time.Duration
-	EncryptionKey         []byte
-	PasswordMinLength     int
-	PasswordRequireSymbol bool
-	PasswordRequireNumber bool
-	PasswordRequireUpper  bool
-	MaxLoginAttempts      int
-	LockoutDuration       time.Duration
-}
-
-// EmailConfig represents email configuration
-type EmailConfig struct {
-	Domain         string
-	SMTPPort       int
-	SMTPSPort      int
-	IMAPPort       int
-	POP3Port       int
-	MaxMessageSize int64
-	EnableDKIM     bool
-	EnableSPF      bool
-	EnableDMARC    bool
-	DKIMSelector   string
-	DKIMPrivateKey string
-}
-
-// NetworkConfig represents network configuration
-type NetworkConfig struct {
-	EnableI2P     bool
-	I2PRouterHost string
-	I2PRouterPort int
-	EnableTor     bool
-	TorProxyHost  string
-	TorProxyPort  int
-}
-
-// StorageConfig represents storage configuration
-type StorageConfig struct {
-	Backend     string
-	LocalPath   string
-	MaxFileSize int64
-}
-
-// LoggingConfig represents logging configuration
-type LoggingConfig struct {
-	Level      string
-	Format     string
-	Output     string
-	FilePath   string
-	MaxSize    int
-	MaxBackups int
-	MaxAge     int
-	Compress   bool
-}
-
-// Load loads configuration from environment and YAML file
-func Load() (*Config, error) {
-	// Load .env file if it exists
-	_ = godotenv.Load()
-
-	// Load YAML config
-	configPath := getEnv("CONFIG_PATH", "./config.yml")
-	configData, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
-	// Parse YAML
-	var yamlConfig Config
-	if err := yaml.Unmarshal(configData, &yamlConfig); err != nil {
-		return nil, fmt.Errorf("failed to parse YAML config: %w", err)
-	}
-
-	// Override with environment variables
-	overrideWithEnv(&yamlConfig)
-
-	// Validate configuration
-	if err := validateConfig(&yamlConfig); err != nil {
-		return nil, fmt.Errorf("config validation failed: %w", err)
-	}
-
-	return &yamlConfig, nil
-}
-
 // overrideWithEnv overrides configuration with environment variables
 func overrideWithEnv(cfg *Config) {
 	// Server
@@ -311,4 +190,156 @@ func (c *Config) IsDevelopment() bool {
 // IsProduction returns true if running in production mode
 func (c *Config) IsProduction() bool {
 	return strings.ToLower(getEnv("ENVIRONMENT", "production")) == "production"
+}
+
+type Config struct {
+	Server   ServerConfig   `yaml:"server"`
+	Database DatabaseConfig `yaml:"database"`
+	Security SecurityConfig `yaml:"security"`
+	Email    EmailConfig    `yaml:"email"`
+	Network  NetworkConfig  `yaml:"network"`
+	Storage  StorageConfig  `yaml:"storage"`
+	Logging  LoggingConfig  `yaml:"logging"`
+}
+
+// ServerConfig contains server configuration
+type ServerConfig struct {
+	Host         string        `yaml:"host"`
+	Port         int           `yaml:"port"`
+	ReadTimeout  time.Duration `yaml:"read_timeout"`
+	WriteTimeout time.Duration `yaml:"write_timeout"`
+	TLSEnabled   bool          `yaml:"tls_enabled"`
+	TLSCertPath  string        `yaml:"tls_cert_path"`
+	TLSKeyPath   string        `yaml:"tls_key_path"`
+}
+
+// DatabaseConfig contains database configuration
+type DatabaseConfig struct {
+	Host            string        `yaml:"host"`
+	Port            int           `yaml:"port"`
+	User            string        `yaml:"user"`
+	Password        string        `yaml:"password"`
+	Database        string        `yaml:"database"`
+	SSLMode         string        `yaml:"ssl_mode"`
+	MaxOpenConns    int           `yaml:"max_open_conns"`
+	MaxIdleConns    int           `yaml:"max_idle_conns"`
+	ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime"`
+}
+
+// SecurityConfig contains security configuration
+type SecurityConfig struct {
+	JWTSecret             string        `yaml:"jwt_secret"`
+	JWTExpiration         time.Duration `yaml:"jwt_expiration"`
+	EncryptionKey         []byte        `yaml:"encryption_key"`
+	PasswordMinLength     int           `yaml:"password_min_length"`
+	PasswordRequireSymbol bool          `yaml:"password_require_symbol"`
+	PasswordRequireNumber bool          `yaml:"password_require_number"`
+	PasswordRequireUpper  bool          `yaml:"password_require_upper"`
+	MaxLoginAttempts      int           `yaml:"max_login_attempts"`
+	LockoutDuration       time.Duration `yaml:"lockout_duration"`
+}
+
+// EmailConfig contains email configuration
+type EmailConfig struct {
+	Domain         string `yaml:"domain"`
+	SMTPPort       int    `yaml:"smtp_port"`
+	SMTPSPort      int    `yaml:"smtps_port"`
+	IMAPPort       int    `yaml:"imap_port"`
+	POP3Port       int    `yaml:"pop3_port"`
+	MaxMessageSize int64  `yaml:"max_message_size"`
+	EnableDKIM     bool   `yaml:"enable_dkim"`
+	EnableSPF      bool   `yaml:"enable_spf"`
+	EnableDMARC    bool   `yaml:"enable_dmarc"`
+	DKIMSelector   string `yaml:"dkim_selector"`
+}
+
+// NetworkConfig contains network configuration
+type NetworkConfig struct {
+	EnableI2P     bool   `yaml:"enable_i2p"`
+	I2PRouterHost string `yaml:"i2p_router_host"`
+	I2PRouterPort int    `yaml:"i2p_router_port"`
+	EnableTor     bool   `yaml:"enable_tor"`
+	TorProxyHost  string `yaml:"tor_proxy_host"`
+	TorProxyPort  int    `yaml:"tor_proxy_port"`
+}
+
+// StorageConfig contains storage configuration
+type StorageConfig struct {
+	Backend     string `yaml:"backend"`
+	LocalPath   string `yaml:"local_path"`
+	MaxFileSize int64  `yaml:"max_file_size"`
+}
+
+// LoggingConfig contains logging configuration
+type LoggingConfig struct {
+	Level      string `yaml:"level"`
+	Format     string `yaml:"format"`
+	Output     string `yaml:"output"`
+	FilePath   string `yaml:"file_path"`
+	MaxSize    int    `yaml:"max_size"`
+	MaxBackups int    `yaml:"max_backups"`
+	MaxAge     int    `yaml:"max_age"`
+	Compress   bool   `yaml:"compress"`
+}
+
+// Load loads configuration from file and environment variables
+func Load() (*Config, error) {
+	// Load .env file if it exists
+	_ = godotenv.Load()
+
+	// Read config file
+	configPath := os.Getenv("CONFIG_PATH")
+	if configPath == "" {
+		configPath = "config.yml"
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	// Override with environment variables if present
+	overrideFromEnv(&cfg)
+
+	return &cfg, nil
+}
+
+// overrideFromEnv overrides configuration with environment variables
+func overrideFromEnv(cfg *Config) {
+	if host := os.Getenv("SERVER_HOST"); host != "" {
+		cfg.Server.Host = host
+	}
+	if port := os.Getenv("SERVER_PORT"); port != "" {
+		fmt.Sscanf(port, "%d", &cfg.Server.Port)
+	}
+
+	// Database overrides
+	if host := os.Getenv("DATABASE_HOST"); host != "" {
+		cfg.Database.Host = host
+	}
+	if port := os.Getenv("DATABASE_PORT"); port != "" {
+		fmt.Sscanf(port, "%d", &cfg.Database.Port)
+	}
+	if user := os.Getenv("DATABASE_USER"); user != "" {
+		cfg.Database.User = user
+	}
+	if password := os.Getenv("DATABASE_PASSWORD"); password != "" {
+		cfg.Database.Password = password
+	}
+	if database := os.Getenv("DATABASE_NAME"); database != "" {
+		cfg.Database.Database = database
+	}
+
+	// Security overrides
+	if secret := os.Getenv("JWT_SECRET"); secret != "" {
+		cfg.Security.JWTSecret = secret
+	}
+	if key := os.Getenv("ENCRYPTION_KEY"); key != "" {
+		cfg.Security.EncryptionKey = []byte(key)
+	}
 }

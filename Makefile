@@ -1,0 +1,252 @@
+# MXIL Server Makefile
+
+# Variables
+BINARY_NAME=mxil-server
+VERSION=1.0.0
+BUILD_TIME=$(shell date -u '+%Y-%m-%d_%H:%M:%S')
+GIT_COMMIT=$(shell git rev-parse --short HEAD)
+GO_VERSION=$(shell go version)
+
+# Build flags
+LDFLAGS=-ldflags "\
+	-X main.version=$(VERSION) \
+	-X main.buildTime=$(BUILD_TIME) \
+	-X main.gitCommit=$(GIT_COMMIT) \
+	-X main.goVersion=$(GO_VERSION) \
+	-w -s"
+
+# Directories
+SRC_DIR=.
+CMD_DIR=./cmd/server
+BUILD_DIR=./build
+DIST_DIR=./dist
+
+# Colors
+RED=\033[0;31m
+GREEN=\033[0;32m
+YELLOW=\033[1;33m
+BLUE=\033[0;34m
+NC=\033[0m # No Color
+
+.PHONY: all build clean test fmt lint run docker-build docker-push migrate help
+
+all: clean fmt lint test build
+
+# Build the application
+build:
+	@echo "$(BLUE)Building $(BINARY_NAME)...$(NC)"
+	@mkdir -p $(BUILD_DIR)
+	CGO_ENABLED=1 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_DIR)
+	@echo "$(GREEN)Build completed: $(BUILD_DIR)/$(BINARY_NAME)$(NC)"
+
+# Build for production (stripped, optimized)
+build-prod:
+	@echo "$(BLUE)Building for production...$(NC)"
+	@mkdir -p $(BUILD_DIR)
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -a -installsuffix cgo -o $(BUILD_DIR)/$(BINARY_NAME)-linux-amd64 $(CMD_DIR)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 $(CMD_DIR)
+	CGO_ENABLED=1 GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-windows-amd64.exe $(CMD_DIR)
+	@echo "$(GREEN)Production builds completed$(NC)"
+
+# Clean build artifacts
+clean:
+	@echo "$(YELLOW)Cleaning...$(NC)"
+	@rm -rf $(BUILD_DIR) $(DIST_DIR) coverage.out coverage.html
+	@go clean
+	@echo "$(GREEN)Clean completed$(NC)"
+
+# Run tests
+test:
+	@echo "$(BLUE)Running tests...$(NC)"
+	@go test ./... -v -cover -race
+	@echo "$(GREEN)Tests completed$(NC)"
+
+# Run tests with coverage
+test-coverage:
+	@echo "$(BLUE)Running tests with coverage...$(NC)"
+	@go test ./... -coverprofile=coverage.out -covermode=atomic
+	@go tool cover -html=coverage.out -o coverage.html
+	@echo "$(GREEN)Coverage report generated: coverage.html$(NC)"
+
+# Format code
+fmt:
+	@echo "$(BLUE)Formatting code...$(NC)"
+	@go fmt ./...
+	@echo "$(GREEN)Formatting completed$(NC)"
+
+# Lint code
+lint:
+	@echo "$(BLUE)Linting code...$(NC)"
+	@if command -v golangci-lint >/dev/null 2>&1; then \
+		golangci-lint run; \
+	else \
+		echo "$(YELLOW)golangci-lint not installed, skipping...$(NC)"; \
+		echo "$(YELLOW)Install with: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest$(NC)"; \
+	fi
+	@echo "$(GREEN)Linting completed$(NC)"
+
+# Run the application
+run:
+	@echo "$(BLUE)Running $(BINARY_NAME)...$(NC)"
+	@go run $(CMD_DIR)/main.go
+
+# Run with hot reload (requires air)
+dev:
+	@if command -v air >/dev/null 2>&1; then \
+		air; \
+	else \
+		echo "$(YELLOW)air not installed, installing...$(NC)"; \
+		go install github.com/cosmtrek/air@latest; \
+		air; \
+	fi
+
+# Generate API documentation
+docs:
+	@echo "$(BLUE)Generating API documentation...$(NC)"
+	@if command -v swag >/dev/null 2>&1; then \
+		swag init -g cmd/server/main.go -o ./docs; \
+	else \
+		echo "$(YELLOW)swag not installed, skipping...$(NC)"; \
+		echo "$(YELLOW)Install with: go install github.com/swaggo/swag/cmd/swag@latest$(NC)"; \
+	fi
+	@echo "$(GREEN)Documentation generated$(NC)"
+
+# Database migrations
+migrate:
+	@echo "$(BLUE)Running database migrations...$(NC)"
+	@go run ./cmd/migrate/main.go
+	@echo "$(GREEN)Migrations completed$(NC)"
+
+# Create migration file
+migration:
+	@echo "$(BLUE)Creating migration file...$(NC)"
+	@read -p "Enter migration name: " name; \
+	timestamp=$$(date +%Y%m%d%H%M%S); \
+	mkdir -p ./migrations; \
+	echo "Creating migration: $${timestamp}_$${name}"; \
+	cat > ./migrations/$${timestamp}_$${name}.up.sql << 'EOF'
+-- Migration: $${name}
+-- Created: $(BUILD_TIME)
+
+-- Add your SQL here
+
+
+EOF
+	cat > ./migrations/$${timestamp}_$${name}.down.sql << 'EOF'
+-- Migration: $${name} (rollback)
+-- Created: $(BUILD_TIME)
+
+-- Add rollback SQL here
+
+
+EOF
+	@echo "$(GREEN)Migration files created$(NC)"
+
+# Docker build
+docker-build:
+	@echo "$(BLUE)Building Docker image...$(NC)"
+	@docker build -t mxil-server:$(VERSION) -t mxil-server:latest .
+	@echo "$(GREEN)Docker build completed$(NC)"
+
+# Docker run
+docker-run:
+	@echo "$(BLUE)Running Docker container...$(NC)"
+	@docker run --rm -p 8080:8080 \
+		-e DATABASE_HOST=localhost \
+		-e DATABASE_PORT=5432 \
+		-e DATABASE_USER=mxil \
+		-e DATABASE_PASSWORD=secure_password_here \
+		-e DATABASE_NAME=mxil \
+		mxil-server:latest
+	@echo "$(GREEN)Docker container stopped$(NC)"
+
+# Docker compose up
+compose-up:
+	@echo "$(BLUE)Starting Docker Compose stack...$(NC)"
+	@docker compose up -d
+	@echo "$(GREEN)Docker Compose stack started$(NC)"
+
+# Docker compose down
+compose-down:
+	@echo "$(YELLOW)Stopping Docker Compose stack...$(NC)"
+	@docker compose down
+	@echo "$(GREEN)Docker Compose stack stopped$(NC)"
+
+# Docker compose logs
+compose-logs:
+	@docker compose logs -f
+
+# Generate SSL certificates
+generate-certs:
+	@echo "$(BLUE)Generating SSL certificates...$(NC)"
+	@mkdir -p nginx/ssl
+	@openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+		-keyout nginx/ssl/key.pem \
+		-out nginx/ssl/cert.pem \
+		-subj "/C=US/ST=State/L=City/O=Organization/CN=mxil.example.com"
+	@echo "$(GREEN)SSL certificates generated$(NC)"
+
+# Security audit
+audit:
+	@echo "$(BLUE)Running security audit...$(NC)"
+	@go list -json -m all | nancy sleuth
+	@if command -v gosec >/dev/null 2>&1; then \
+		gosec ./...; \
+	else \
+		echo "$(YELLOW)gosec not installed, skipping...$(NC)"; \
+		echo "$(YELLOW)Install with: go install github.com/securego/gosec/v2/cmd/gosec@latest$(NC)"; \
+	fi
+	@echo "$(GREEN)Security audit completed$(NC)"
+
+# Benchmarks
+bench:
+	@echo "$(BLUE)Running benchmarks...$(NC)"
+	@go test -bench=. -benchmem ./...
+	@echo "$(GREEN)Benchmarks completed$(NC)"
+
+# Release preparation
+release: clean test-coverage lint build-prod
+	@echo "$(BLUE)Preparing release $(VERSION)...$(NC)"
+	@mkdir -p $(DIST_DIR)
+	@cp $(BUILD_DIR)/* $(DIST_DIR)/
+	@cp README.md LICENSE $(DIST_DIR)/
+	@cp .env.example config.example.yml $(DIST_DIR)/
+	@tar -czf $(DIST_DIR)/mxil-server-$(VERSION).tar.gz -C $(DIST_DIR) .
+	@echo "$(GREEN)Release package created: $(DIST_DIR)/mxil-server-$(VERSION).tar.gz$(NC)"
+
+# Help
+help:
+	@echo "$(BLUE)MXIL Server Makefile$(NC)"
+	@echo ""
+	@echo "$(YELLOW)Available commands:$(NC)"
+	@echo "  $(GREEN)build$(NC)        - Build the application"
+	@echo "  $(GREEN)build-prod$(NC)   - Build for production (multiple platforms)"
+	@echo "  $(GREEN)clean$(NC)        - Clean build artifacts"
+	@echo "  $(GREEN)test$(NC)         - Run tests"
+	@echo "  $(GREEN)test-coverage$(NC)- Run tests with coverage report"
+	@echo "  $(GREEN)fmt$(NC)          - Format code"
+	@echo "  $(GREEN)lint$(NC)         - Lint code"
+	@echo "  $(GREEN)run$(NC)          - Run the application"
+	@echo "  $(GREEN)dev$(NC)          - Run with hot reload (requires air)"
+	@echo "  $(GREEN)docs$(NC)         - Generate API documentation"
+	@echo "  $(GREEN)migrate$(NC)      - Run database migrations"
+	@echo "  $(GREEN)migration$(NC)    - Create new migration files"
+	@echo "  $(GREEN)docker-build$(NC) - Build Docker image"
+	@echo "  $(GREEN)docker-run$(NC)   - Run Docker container"
+	@echo "  $(GREEN)compose-up$(NC)   - Start Docker Compose stack"
+	@echo "  $(GREEN)compose-down$(NC) - Stop Docker Compose stack"
+	@echo "  $(GREEN)compose-logs$(NC) - View Docker Compose logs"
+	@echo "  $(GREEN)generate-certs$(NC)- Generate SSL certificates"
+	@echo "  $(GREEN)audit$(NC)        - Run security audit"
+	@echo "  $(GREEN)bench$(NC)        - Run benchmarks"
+	@echo "  $(GREEN)release$(NC)      - Prepare release package"
+	@echo "  $(GREEN)help$(NC)         - Show this help message"
+	@echo ""
+	@echo "$(YELLOW)Example workflow:$(NC)"
+	@echo "  make migration"
+	@echo "  # Edit the migration files"
+	@echo "  make migrate"
+	@echo "  make test"
+	@echo "  make build"
+	@echo "  make docker-build"
+	@echo "  make compose-up"

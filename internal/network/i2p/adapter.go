@@ -1,4 +1,3 @@
-// internal/network/i2p/adapter.go
 package i2p
 
 import (
@@ -14,21 +13,21 @@ import (
 	"github.com/okavatti/mxil-server/m/internal/service"
 
 	i2pkeys "github.com/go-i2p/i2pkeys"
-	sam3 "github.com/go-i2p/sam3" // Changed import path
+	"github.com/go-i2p/sam3"
 )
 
-// I2PAdapter handles I2P network operations using the SAMv3 protocol.
+// I2PAdapter handles I2P network operations
 type I2PAdapter struct {
-	samAddr       string              // Address of the SAM bridge (e.g., "127.0.0.1:7656")
-	streamSession *sam3.StreamSession // SAM stream session for reliable communication
+	samAddr       string
+	streamSession *sam3.StreamSession
+	sam           *sam3.SAM
+	keys          i2pkeys.I2PKeys
+	base32Addr    string
 	lastStatus    service.NetworkStatus
-	base32Addr    string           // Our I2P destination address (base32)
-	sam           *sam3.SAM        // SAM connection
-	keys          *i2pkeys.I2PKeys // I2P keys for this session
+	listener      net.Listener
 }
 
-// NewI2PAdapter creates a new I2P adapter.
-// samAddr is typically "127.0.0.1:7656" for the default SAM bridge.
+// NewI2PAdapter creates a new I2P adapter
 func NewI2PAdapter(samAddr string) *I2PAdapter {
 	return &I2PAdapter{
 		samAddr: samAddr,
@@ -39,308 +38,257 @@ func NewI2PAdapter(samAddr string) *I2PAdapter {
 	}
 }
 
-// Connect establishes a connection to the I2P network via the SAM bridge.
+// Connect establishes I2P connection
 func (a *I2PAdapter) Connect(ctx context.Context) error {
+	// Connect to SAM bridge
 	sam, err := sam3.NewSAM(a.samAddr)
 	if err != nil {
-		a.updateStatus(false, fmt.Sprintf("Failed to connect to SAM bridge: %v", err))
-		return err
+		return fmt.Errorf("SAM connection failed: %w", err)
 	}
 	a.sam = sam
 
-	// Generate a new I2P session with a random destination for anonymity.
+	// Generate or load keys
 	keys, err := sam.NewKeys()
 	if err != nil {
 		sam.Close()
-		a.updateStatus(false, fmt.Sprintf("Failed to generate I2P keys: %v", err))
-		return err
+		return fmt.Errorf("key generation failed: %w", err)
 	}
-	a.keys = &keys
+	a.keys = keys
 
-	// Create a streaming session (reliable, ordered delivery, suitable for email).
-	session, err := sam.NewStreamSession("mxil-session", keys, sam3.Options_Medium)
+	// Create stream session
+	session, err := sam.NewStreamSession("mxil-email", keys, sam3.Options_Medium)
 	if err != nil {
 		sam.Close()
-		a.updateStatus(false, fmt.Sprintf("Failed to create I2P stream session: %v", err))
-		return err
+		return fmt.Errorf("session creation failed: %w", err)
+	}
+	a.streamSession = session
+
+	// Get our address
+	a.base32Addr = keys.Addr().Base32()
+
+	// Start listener
+	listener, err := session.Listen()
+	if err != nil {
+		return fmt.Errorf("listener creation failed: %w", err)
+	}
+	a.listener = listener
+
+	a.lastStatus = service.NetworkStatus{
+		IsHealthy:   true,
+		LastChecked: time.Now(),
 	}
 
-	a.streamSession = session
-	a.base32Addr = keys.Addr().Base32() // Save our public I2P address
-
-	a.updateStatus(true, "")
 	return nil
 }
 
-// Disconnect closes the SAM session and cleans up resources.
+// Disconnect closes I2P connection
 func (a *I2PAdapter) Disconnect(ctx context.Context) error {
+	if a.listener != nil {
+		a.listener.Close()
+	}
 	if a.streamSession != nil {
 		a.streamSession.Close()
-		a.streamSession = nil
 	}
 	if a.sam != nil {
 		a.sam.Close()
-		a.sam = nil
 	}
-	// Reset keys to zero value
-	var zeroKeys i2pkeys.I2PKeys
-	a.keys = &zeroKeys
-	a.updateStatus(false, "Disconnected")
+
+	a.lastStatus.IsHealthy = false
 	return nil
 }
 
-// Send sends an email to an I2P destination address.
-// The recipient address in email.ToAddresses should be a valid I2P base32 address (.i2p).
+// Send sends email via I2P
 func (a *I2PAdapter) Send(ctx context.Context, email *models.Email) error {
 	if a.streamSession == nil {
-		return fmt.Errorf("not connected to I2P network")
+		return fmt.Errorf("not connected to I2P")
 	}
 
-	// For simplicity, we send to the first recipient.
-	// In production, you would iterate and handle each.
+	// Get first recipient (for now)
 	if len(email.ToAddresses) == 0 {
-		return fmt.Errorf("no recipient address provided")
+		return fmt.Errorf("no recipients")
 	}
+
 	recipient := email.ToAddresses[0]
-
-	// Clean and validate the recipient address
-	recipient = strings.TrimSpace(recipient)
 	if !strings.HasSuffix(recipient, ".i2p") && !strings.Contains(recipient, ".b32.i2p") {
-		return fmt.Errorf("invalid I2P address format: %s", recipient)
+		return fmt.Errorf("invalid I2P address: %s", recipient)
 	}
 
-	// Dial the recipient's I2P address.
-	conn, err := a.streamSession.Dial("i2p", recipient)
+	// Dial recipient
+	conn, err := a.streamSession.DialContext(ctx, "i2p", recipient)
 	if err != nil {
-		a.updateStatus(false, fmt.Sprintf("Failed to dial I2P recipient %s: %v", recipient, err))
-		return err
+		return fmt.Errorf("dial failed: %w", err)
 	}
 	defer conn.Close()
 
-	// Set deadlines for the connection
+	// Set deadline
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(deadline)
 	} else {
 		conn.SetDeadline(time.Now().Add(30 * time.Second))
 	}
 
-	// Convert email to a simple string format for transmission.
-	message := a.convertToI2PMessage(email)
+	// Build I2P email message
+	message := a.buildI2PMessage(email)
 
-	// Write the message
+	// Send message
 	_, err = conn.Write([]byte(message))
 	if err != nil {
-		a.updateStatus(false, fmt.Sprintf("Failed to send data to %s: %v", recipient, err))
-		return err
+		return fmt.Errorf("write failed: %w", err)
 	}
 
-	// Send end-of-message marker
+	// Send end marker
 	_, err = conn.Write([]byte("\n.\n"))
 	if err != nil {
-		a.updateStatus(false, fmt.Sprintf("Failed to send EOM to %s: %v", recipient, err))
-		return err
+		return fmt.Errorf("end marker failed: %w", err)
 	}
 
-	a.updateStatus(true, "")
 	return nil
 }
 
-// Receive starts listening for incoming I2P connections and emails.
-// It returns a channel where received emails will be sent.
+// Receive receives emails from I2P
 func (a *I2PAdapter) Receive(ctx context.Context) (chan *models.Email, error) {
+	if a.listener == nil {
+		return nil, fmt.Errorf("listener not initialized")
+	}
+
 	emailChan := make(chan *models.Email, 100)
 
-	if a.streamSession == nil {
-		return nil, fmt.Errorf("not connected to I2P network")
-	}
-
-	// Start listening for incoming connections.
-	listener, err := a.streamSession.Listen()
-	if err != nil {
-		return nil, fmt.Errorf("failed to start I2P listener: %v", err)
-	}
-
-	go a.listenForConnections(ctx, listener, emailChan)
+	go a.acceptConnections(ctx, emailChan)
 
 	return emailChan, nil
 }
 
-// HealthCheck verifies the I2P network and SAM bridge are accessible.
-func (a *I2PAdapter) HealthCheck(ctx context.Context) (service.NetworkStatus, error) {
-	start := time.Now()
-
-	// Try to create a temporary SAM connection to test the bridge.
-	testSam, err := sam3.NewSAM(a.samAddr)
-	if err != nil {
-		latency := time.Since(start)
-		a.lastStatus.Latency = latency
-		a.updateStatus(false, fmt.Sprintf("SAM bridge unreachable: %v", err))
-		return a.lastStatus, err
-	}
-	testSam.Close()
-
-	// If we have a session, also verify we can still perform a basic operation.
-	if a.streamSession != nil {
-		// A simple check: ensure our local destination is still valid.
-		if a.base32Addr == "" {
-			latency := time.Since(start)
-			a.lastStatus.Latency = latency
-			a.updateStatus(false, "I2P session has no valid address")
-			return a.lastStatus, fmt.Errorf("I2P session invalid")
-		}
-	}
-
-	latency := time.Since(start)
-	a.lastStatus.Latency = latency
-	a.updateStatus(true, "")
-	return a.lastStatus, nil
-}
-
-// listenForConnections accepts incoming I2P connections and processes them.
-func (a *I2PAdapter) listenForConnections(ctx context.Context, listener net.Listener, emailChan chan<- *models.Email) {
+// acceptConnections accepts incoming I2P connections
+func (a *I2PAdapter) acceptConnections(ctx context.Context, emailChan chan<- *models.Email) {
 	defer close(emailChan)
-	defer listener.Close()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			// Use a goroutine with timeout for non-blocking Accept
-			connChan := make(chan net.Conn, 1)
-			errChan := make(chan error, 1)
+			a.listener.(*net.TCPListener).SetDeadline(time.Now().Add(1 * time.Second))
 
-			go func() {
-				conn, err := listener.Accept()
-				if err != nil {
-					errChan <- err
-					return
-				}
-				connChan <- conn
-			}()
-
-			select {
-			case <-time.After(1 * time.Second):
-				continue // Timeout, check context
-			case err := <-errChan:
-				if ctx.Err() != nil {
-					return // Context cancelled
-				}
+			conn, err := a.listener.Accept()
+			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					continue
 				}
-				fmt.Printf("Error accepting I2P connection: %v\n", err)
-				continue
-			case conn := <-connChan:
-				go a.handleIncomingConnection(ctx, conn, emailChan)
+				return
 			}
+
+			go a.handleConnection(ctx, conn, emailChan)
 		}
 	}
 }
 
-// handleIncomingConnection reads data from a connection and converts it to an Email model.
-func (a *I2PAdapter) handleIncomingConnection(ctx context.Context, conn net.Conn, emailChan chan<- *models.Email) {
+// handleConnection handles an incoming I2P connection
+func (a *I2PAdapter) handleConnection(ctx context.Context, conn net.Conn, emailChan chan<- *models.Email) {
 	defer conn.Close()
 
-	// Set read deadline
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	// Read the entire message
-	buffer := make([]byte, 0, 65536)
+	// Read message
+	var buffer []byte
 	readBuffer := make([]byte, 4096)
 
 	for {
 		n, err := conn.Read(readBuffer)
 		if err != nil {
 			if err != io.EOF {
-				fmt.Printf("Error reading from I2P connection: %v\n", err)
+				return
 			}
 			break
 		}
+
 		buffer = append(buffer, readBuffer[:n]...)
 
-		// Check for end-of-message marker
-		if n > 0 && strings.HasSuffix(string(buffer), "\n.\n") {
+		if strings.HasSuffix(string(buffer), "\n.\n") {
 			buffer = buffer[:len(buffer)-3]
 			break
 		}
 
-		// Prevent buffer overflow
-		if len(buffer) > 65536 {
-			fmt.Printf("Message too large, truncating\n")
-			break
+		if len(buffer) > 10*1024*1024 { // 10MB limit
+			return
 		}
 	}
 
-	// Parse the raw data into an Email model.
-	rawMessage := string(buffer)
-	email, err := a.parseI2PMessage(rawMessage)
-	if err != nil {
-		fmt.Printf("Failed to parse I2P message: %v\n", err)
+	// Parse message
+	email := a.parseI2PMessage(string(buffer))
+	if email == nil {
 		return
 	}
 
-	// Extract remote address if available
+	// Set remote address
 	if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
 		email.FromAddress = remoteAddr.String()
 	}
 
 	select {
 	case emailChan <- email:
-		// Successfully queued the email for further processing.
 	case <-ctx.Done():
-		// Context cancelled, drop the email.
 	case <-time.After(5 * time.Second):
-		fmt.Printf("Timeout trying to send email to channel\n")
 	}
 }
 
-// updateStatus is a helper to update the lastStatus field.
-func (a *I2PAdapter) updateStatus(healthy bool, lastError string) {
+// HealthCheck checks I2P connectivity
+func (a *I2PAdapter) HealthCheck(ctx context.Context) (service.NetworkStatus, error) {
+	start := time.Now()
+
+	// Test SAM connection
+	testSAM, err := sam3.NewSAM(a.samAddr)
+	if err != nil {
+		a.lastStatus = service.NetworkStatus{
+			IsHealthy:   false,
+			LastError:   err.Error(),
+			LastChecked: time.Now(),
+			Latency:     time.Since(start),
+		}
+		return a.lastStatus, err
+	}
+	testSAM.Close()
+
 	a.lastStatus = service.NetworkStatus{
-		IsHealthy:    healthy,
-		LastError:    lastError,
-		LastChecked:  time.Now(),
-		MessageCount: a.lastStatus.MessageCount,
-		Latency:      a.lastStatus.Latency,
+		IsHealthy:   true,
+		LastChecked: time.Now(),
+		Latency:     time.Since(start),
 	}
+
+	return a.lastStatus, nil
 }
 
-// convertToI2PMessage transforms an Email model into a string for I2P transmission.
-func (a *I2PAdapter) convertToI2PMessage(email *models.Email) string {
-	headers := fmt.Sprintf(
-		"I2P-EMAIL-V1\nFrom: %s\nTo: %s\nSubject: %s\nDate: %s\nMessage-ID: %s\n",
-		email.FromAddress,
-		joinAddresses(email.ToAddresses),
-		email.Subject,
-		time.Now().Format(time.RFC1123Z),
-		email.MessageID,
-	)
+// buildI2PMessage builds I2P email format
+func (a *I2PAdapter) buildI2PMessage(email *models.Email) string {
+	var builder strings.Builder
+
+	builder.WriteString("I2P-EMAIL-V1\n")
+	builder.WriteString(fmt.Sprintf("From: %s\n", email.FromAddress))
+	builder.WriteString(fmt.Sprintf("To: %s\n", strings.Join(email.ToAddresses, ", ")))
+	builder.WriteString(fmt.Sprintf("Subject: %s\n", email.Subject))
+	builder.WriteString(fmt.Sprintf("Message-ID: %s\n", email.MessageID))
+	builder.WriteString(fmt.Sprintf("Date: %s\n", time.Now().Format(time.RFC1123Z)))
 
 	if email.InReplyTo != "" {
-		headers += fmt.Sprintf("In-Reply-To: %s\n", email.InReplyTo)
+		builder.WriteString(fmt.Sprintf("In-Reply-To: %s\n", email.InReplyTo))
 	}
 
 	if len(email.References) > 0 {
-		headers += fmt.Sprintf("References: %s\n", strings.Join(email.References, " "))
+		builder.WriteString(fmt.Sprintf("References: %s\n", strings.Join(email.References, " ")))
 	}
 
-	headers += fmt.Sprintf("Content-Type: text/plain; charset=utf-8\n\n")
+	builder.WriteString("Content-Type: text/plain; charset=utf-8\n\n")
+	builder.WriteString(email.BodyPlain)
 
-	return headers + email.BodyPlain
+	return builder.String()
 }
 
-// parseI2PMessage attempts to parse a raw string into an Email model.
-func (a *I2PAdapter) parseI2PMessage(raw string) (*models.Email, error) {
+// parseI2PMessage parses I2P email format
+func (a *I2PAdapter) parseI2PMessage(raw string) *models.Email {
 	lines := strings.Split(raw, "\n")
 
 	email := &models.Email{
 		ID:          uuid.New(),
-		MessageID:   fmt.Sprintf("<%s@mxil.i2p>", uuid.New().String()),
-		FromAddress: "unknown@i2p",
-		ToAddresses: []string{a.base32Addr},
-		Subject:     "I2P Email",
-		BodyPlain:   raw,
+		MessageID:   fmt.Sprintf("<%s@i2p>", uuid.New().String()),
 		ReceivedVia: models.NetworkI2P,
 		ReceivedAt:  time.Now(),
 	}
@@ -368,7 +316,7 @@ func (a *I2PAdapter) parseI2PMessage(raw string) (*models.Email, error) {
 				case "From":
 					email.FromAddress = value
 				case "To":
-					email.ToAddresses = []string{value}
+					email.ToAddresses = models.StringArray(strings.Split(value, ", "))
 				case "Subject":
 					email.Subject = value
 				case "Message-ID":
@@ -376,7 +324,7 @@ func (a *I2PAdapter) parseI2PMessage(raw string) (*models.Email, error) {
 				case "In-Reply-To":
 					email.InReplyTo = value
 				case "References":
-					email.References = strings.Split(value, " ")
+					email.References = models.StringArray(strings.Fields(value))
 				case "Date":
 					if t, err := time.Parse(time.RFC1123Z, value); err == nil {
 						email.SentAt = &t
@@ -392,15 +340,10 @@ func (a *I2PAdapter) parseI2PMessage(raw string) (*models.Email, error) {
 		email.BodyPlain = strings.Join(bodyLines, "\n")
 	}
 
-	return email, nil
+	return email
 }
 
-// joinAddresses is a helper to join a slice of addresses into a comma-separated string.
-func joinAddresses(addresses []string) string {
-	return strings.Join(addresses, ", ")
-}
-
-// GetBase32Address returns our I2P base32 address.
+// GetBase32Address returns our I2P address
 func (a *I2PAdapter) GetBase32Address() string {
 	return a.base32Addr
 }
