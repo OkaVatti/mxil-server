@@ -5,11 +5,14 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
 
-MXIL (Multi-network eXchange & Interconnect Layer) is a privacy-focused, multi-network email server that supports clearnet, I2P, and other networks. It provides end-to-end encryption, advanced security features, and a modern REST API.
+MXIL (Multi-network eXchange & Interconnect Layer) is a privacy-focused,
+multi-network email server that supports clearnet, I2P, TOR, and IPFS.
+It provides end-to-end encryption, advanced security features, and a
+modern REST API.
 
 ## Features
 
-- **Multi-Network Support**: Send and receive emails via clearnet, I2P, and Tor
+- **Multi-Network Support**: Send and receive emails via clearnet, I2P, TOR, and IPFS
 - **End-to-End Encryption**: Built-in encryption for all communications
 - **Privacy Focused**: Metadata minimization, no tracking, self-hosted
 - **Modern API**: RESTful API with WebSocket support for real-time updates
@@ -22,46 +25,46 @@ MXIL (Multi-network eXchange & Interconnect Layer) is a privacy-focused, multi-n
 ### Prerequisites
 
 - Go 1.25+
-- PostgreSQL 15+
-- Redis 7+
+- PostgreSQL 18+
+- Valkey 9+
 - Docker & Docker Compose (optional)
 
 ### Installation
 
 1. **Clone the repository**
 
-   ```bash
-   git clone https://github.com/yourusername/mxil-server.git
-   cd mxil-server
-   ```
+```bash
+git clone https://github.com/yourusername/mxil-server.git
+cd mxil-server
+```
 
 2. **Configure Environment Variables**
    Copy the example configuration file and modify it as needed:
 
-   ```bash
-   cp .env.example .env
-   cp config.example.yml config.yml
-   ```
+```bash
+cp .env.example .env
+cp config.example.yml config.yml
+```
 
 3. **Build and run**
 
-   Using Docker Compose:
+Using Docker Compose:
 
-   ```bash
-   docker-compose up --build
-   ```
+```bash
+docker-compose up --build
+```
 
-   ```bash
-   make build
-   ./build/mxil-server
-   ```
+```bash
+make build
+./build/mxil-server
+```
 
-   Or build and run manually:
+Or build and run manually:
 
-   ```bash
-   go build -o mxil-server ./cmd/mxil-server
-   ./mxil-server
-   ```
+```bash
+go build -o mxil-server ./cmd/mxil-server
+./mxil-server
+```
 
 ### Using Docker
 

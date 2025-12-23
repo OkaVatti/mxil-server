@@ -64,9 +64,9 @@ func (a *SMTPAdapter) Send(email *models.Email) error {
 	}
 
 	// Send email
-	from := mail.Address{Address: email.From}
-	to := make([]string, len(email.To))
-	for i, recipient := range email.To {
+	from := mail.Address{Address: email.FromAddress}
+	to := make([]string, len(email.ToAddresses))
+	for i, recipient := range email.ToAddresses {
 		to[i] = recipient
 	}
 
@@ -135,10 +135,10 @@ func (a *SMTPAdapter) createMessage(email *models.Email) ([]byte, error) {
 	msg := mail.NewMSG()
 
 	// Set headers
-	msg.SetFrom(email.From)
-	msg.AddTo(email.To...)
-	msg.AddCc(email.Cc...)
-	msg.AddBcc(email.Bcc...)
+	msg.SetFrom(email.FromAddress)
+	msg.AddTo(email.ToAddresses...)
+	msg.AddCc(email.CcAddresses...)
+	msg.AddBcc(email.BccAddresses...)
 	msg.SetSubject(email.Subject)
 
 	// Set body
@@ -172,21 +172,21 @@ func (a *SMTPAdapter) createMessage(email *models.Email) ([]byte, error) {
 
 // Helper method to validate email
 func (a *SMTPAdapter) validateEmail(email *models.Email) error {
-	if email.From == "" {
+	if email.FromAddress == "" {
 		return fmt.Errorf("sender is required")
 	}
 
-	if len(email.To) == 0 && len(email.Cc) == 0 && len(email.Bcc) == 0 {
+	if len(email.ToAddresses) == 0 && len(email.CcAddresses) == 0 && len(email.BccAddresses) == 0 {
 		return fmt.Errorf("at least one recipient is required")
 	}
 
 	// Validate sender
-	if _, err := mail.ParseAddress(email.From); err != nil {
+	if _, err := mail.ParseAddress(email.FromAddress); err != nil {
 		return fmt.Errorf("invalid sender address: %w", err)
 	}
 
 	// Validate recipients
-	allRecipients := append(append(email.To, email.Cc...), email.Bcc...)
+	allRecipients := append(append(email.ToAddresses, email.CcAddresses...), email.BccAddresses...)
 	for _, recipient := range allRecipients {
 		if _, err := mail.ParseAddress(recipient); err != nil {
 			return fmt.Errorf("invalid recipient address %s: %w", recipient, err)

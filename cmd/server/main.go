@@ -1,3 +1,4 @@
+// cmd/server/main_fixed.go
 package main
 
 import (
@@ -22,7 +23,11 @@ import (
 	"github.com/okavatti/mxil-server/m/internal/email"
 	"github.com/okavatti/mxil-server/m/internal/migrations"
 	"github.com/okavatti/mxil-server/m/internal/repository"
-	"github.com/okavatti/mxil-server/m/internal/service"
+	authservice "github.com/okavatti/mxil-server/m/internal/service/auth"
+	cryptoservice "github.com/okavatti/mxil-server/m/internal/service/crypto"
+	emailservice "github.com/okavatti/mxil-server/m/internal/service/email"
+	networkservice "github.com/okavatti/mxil-server/m/internal/service/network"
+	storageservice "github.com/okavatti/mxil-server/m/internal/service/storage"
 )
 
 func main() {
@@ -54,13 +59,13 @@ func main() {
 	}
 
 	// Initialize services
-	services, err := initServices(db, cfg, logger)
+	services, handlers, err := initServicesAndHandlers(db, cfg, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize services", zap.Error(err))
 	}
 
 	// Initialize HTTP server
-	e := initHTTPServer(services, cfg, logger)
+	e := initHTTPServer(handlers, cfg, logger)
 
 	// Start server
 	go func() {
@@ -127,47 +132,92 @@ func runMigrations(db *sqlx.DB, logger *zap.Logger) error {
 	return migrationManager.Run()
 }
 
-func initServices(db *sqlx.DB, cfg *config.Config, logger *zap.Logger) (*service.Services, error) {
+func initServicesAndHandlers(db *sqlx.DB, cfg *config.Config, logger *zap.Logger) (
+	interface{},
+	*handlers.Handlers,
+	error,
+) {
 	// Initialize repositories
-	repos := repository.NewRepositories(db, logger)
+	userRepo := repository.NewUserRepository(db, logger)
+	sessionRepo := repository.NewSessionRepository(db, logger)
+	emailRepo := repository.NewEmailRepository(db, logger)
+	folderRepo := repository.NewFolderRepository(db, logger)
+	labelRepo := repository.NewLabelRepository(db, logger)
+	contactRepo := repository.NewContactRepository(db, logger)
+	networkRepo := repository.NewNetworkIdentityRepository(db, logger)
+	providerRepo := repository.NewProviderBridgeRepository(db, logger)
+	keyRepo := repository.NewEncryptionKeyRepository(db, logger)
+	statsRepo := repository.NewStatsRepository(db, logger)
+	passwordResetRepo := repository.NewPasswordResetRepository(db, logger)
 
 	// Initialize JWT service
-	jwtService := auth.NewJWTService([]byte(cfg.Security.JWTSecret), cfg.Security.JWTExpiration)
+	jwtService := auth.NewJWTService(cfg.Security.JWTSecret, cfg.Security.JWTExpiration)
 
 	// Initialize crypto service
-	cryptoService := service.NewCryptoService(cfg.Security.EncryptionKey)
+	cryptoService := cryptoservice.NewCryptoService()
+
+	// Initialize storage service
+	storageService, err := storageservice.NewStorageService(cfg.Storage, logger)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to initialize storage: %w", err)
+	}
+
+	// Initialize network service
+	networkAdapters := make(map[models.NetworkType]networkservice.NetworkAdapter)
+	// TODO: Initialize network adapters
+	networkSvc := networkservice.NewNetworkService(networkAdapters, logger)
+
+	// Initialize email parser and pipeline
+	emailParser := email.NewEmailParser()
+	emailPipeline := email.NewEmailPipeline()
 
 	// Initialize email service
-	emailService := email.NewService(
-		repos.Email,
-		repos.User,
-		email.NewParser(),
-		email.NewPipeline(),
-		service.NewStorageService(cfg.Storage),
+	emailSvc := emailservice.NewEmailService(
+		emailRepo,
+		userRepo,
+		emailParser,
+		emailPipeline,
+		storageService,
+		networkSvc,
 		cryptoService,
+		logger,
 	)
 
 	// Initialize auth service
-	authService := service.NewAuthService(
-		repos.User,
-		repos.Session,
+	authSvc := authservice.NewAuthService(
+		userRepo,
+		sessionRepo,
+		passwordResetRepo,
 		jwtService,
 		cryptoService,
-		cfg.Security,
+		cfg.Security.LockoutDuration,
+		cfg.Security.MaxLoginAttempts,
+		logger,
 	)
 
-	// Initialize network service
-	networkService := service.NewNetworkService(cfg.Network)
+	// Initialize handlers
+	h := handlers.NewHandlers(
+		authSvc,
+		emailSvc,
+		networkSvc,
+		cryptoService,
+		userRepo,
+		emailRepo,
+		sessionRepo,
+		folderRepo,
+		labelRepo,
+		contactRepo,
+		networkRepo,
+		providerRepo,
+		keyRepo,
+		statsRepo,
+		logger,
+	)
 
-	return &service.Services{
-		Auth:    authService,
-		Email:   emailService,
-		Crypto:  cryptoService,
-		Network: networkService,
-	}, nil
+	return nil, h, nil
 }
 
-func initHTTPServer(services *service.Services, cfg *config.Config, logger *zap.Logger) *echo.Echo {
+func initHTTPServer(h *handlers.Handlers, cfg *config.Config, logger *zap.Logger) *echo.Echo {
 	e := echo.New()
 
 	// Middleware
@@ -177,9 +227,6 @@ func initHTTPServer(services *service.Services, cfg *config.Config, logger *zap.
 		AllowOrigins: []string{"*"},
 		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete},
 	}))
-
-	// Initialize handlers
-	h := handlers.NewHandlers(services, logger)
 
 	// Routes
 	api := e.Group("/api/v1")

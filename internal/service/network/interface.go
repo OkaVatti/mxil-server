@@ -1,4 +1,3 @@
-// internal/service/network/interface.go
 package network
 
 import (

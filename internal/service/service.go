@@ -15,9 +15,9 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/okavatti/mxil-server/internal/auth"
-	"github.com/okavatti/mxil-server/internal/config"
-	"github.com/okavatti/mxil-server/internal/repository"
+	"github.com/okavatti/mxil-server/m/internal/auth"
+	"github.com/okavatti/mxil-server/m/internal/config"
+	"github.com/okavatti/mxil-server/m/internal/repository"
 )
 
 type Services struct {
