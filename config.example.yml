@@ -1,0 +1,66 @@
+# config.example.yml
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: "30s"
+  write_timeout: "30s"
+  tls_enabled: false
+  tls_cert_path: "/path/to/cert.pem"
+  tls_key_path: "/path/to/key.pem"
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "mxil"
+  password: "secure_password_here"
+  database: "mxil"
+  ssl_mode: "require"
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: "5m"
+
+security:
+  jwt_secret: "change_me_to_random_string_at_least_32_chars"
+  jwt_expiration: "24h"
+  encryption_key: "32_byte_encryption_key_change_me_in_production"
+  password_min_length: 12
+  password_require_symbol: true
+  password_require_number: true
+  password_require_upper: true
+  max_login_attempts: 5
+  lockout_duration: "15m"
+
+email:
+  domain: "mxil.example.com"
+  smtp_port: 587
+  smtps_port: 465
+  imap_port: 993
+  pop3_port: 995
+  max_message_size: 52428800  # 50MB
+  enable_dkim: true
+  enable_spf: true
+  enable_dmarc: true
+  dkim_selector: "default"
+
+network:
+  enable_i2p: false
+  i2p_router_host: "localhost"
+  i2p_router_port: 7657
+  enable_tor: false
+  tor_proxy_host: "localhost"
+  tor_proxy_port: 9050
+
+storage:
+  backend: "local"
+  local_path: "./data/storage"
+  max_file_size: 104857600  # 100MB
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  file_path: "./logs/mxil.log"
+  max_size: 100
+  max_backups: 3
+  max_age: 28
+  compress: true

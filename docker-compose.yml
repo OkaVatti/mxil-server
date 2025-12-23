@@ -1,0 +1,110 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: mxil
+      POSTGRES_PASSWORD: secure_password_here
+      POSTGRES_DB: mxil
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mxil"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mxil-network
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mxil-network
+
+  mxil-backend:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_USER=mxil
+      - DATABASE_PASSWORD=secure_password_here
+      - DATABASE_NAME=mxil
+      - CACHE_HOST=redis
+      - CACHE_PORT=6379
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      - JWT_SECRET=change_me_to_random_string_at_least_32_chars
+      - ENCRYPTION_KEY=32_byte_encryption_key_change_me_in_production
+    volumes:
+      - ./data/storage:/app/data/storage
+      - ./logs:/app/logs
+      - ./config:/app/config
+    ports:
+      - "8080:8080"
+    networks:
+      - mxil-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Optional: I2P router (if using I2P network)
+  i2p:
+    image: geti2p/i2p:latest
+    container_name: i2p
+    ports:
+      - "4444:4444"  # HTTP proxy
+      - "4445:4445"  # HTTPS proxy
+      - "7656:7656"  # SAM bridge
+      - "7657:7657"  # I2P control
+    volumes:
+      - i2p_data:/home/i2p/.i2p
+    networks:
+      - mxil-network
+    restart: unless-stopped
+
+  # Optional: Nginx reverse proxy with TLS
+  nginx:
+    image: nginx:alpine
+    depends_on:
+      - mxil-backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./nginx/html:/usr/share/nginx/html
+    networks:
+      - mxil-network
+    restart: unless-stopped
+
+networks:
+  mxil-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  i2p_data:
+    driver: local
