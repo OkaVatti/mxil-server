@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/google/uuid"
-	"github.com/okavatti/mxil-server/internal/models"
+	"github.com/okavatti/mxil-server/m/internal/models"
 )
 
 // AuthService interface

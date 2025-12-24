@@ -1,6 +1,8 @@
+// internal/api/handlers/auth.go
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"time"
@@ -9,21 +11,34 @@ import (
 	"github.com/labstack/echo/v4"
 	"go.uber.org/zap"
 
-	"github.com/okavatti/mxil-server/m/internal/crypto"
+	"github.com/okavatti/mxil-server/m/internal/models"
+	"github.com/okavatti/mxil-server/m/internal/repository"
 	"github.com/okavatti/mxil-server/m/internal/service"
 )
 
 // AuthHandler handles authentication requests
 type AuthHandler struct {
-	authService service.AuthService
-	logger      *zap.Logger
+	authService   service.AuthService
+	userRepo      *repository.UserRepository
+	sessionRepo   *repository.SessionRepository
+	cryptoService service.CryptoService
+	logger        *zap.Logger
 }
 
 // NewAuthHandler creates a new auth handler
-func NewAuthHandler(authService service.AuthService, logger *zap.Logger) *AuthHandler {
+func NewAuthHandler(
+	authService service.AuthService,
+	userRepo *repository.UserRepository,
+	sessionRepo *repository.SessionRepository,
+	cryptoService service.CryptoService,
+	logger *zap.Logger,
+) *AuthHandler {
 	return &AuthHandler{
-		authService: authService,
-		logger:      logger,
+		authService:   authService,
+		userRepo:      userRepo,
+		sessionRepo:   sessionRepo,
+		cryptoService: cryptoService,
+		logger:        logger,
 	}
 }
 
@@ -31,10 +46,9 @@ func NewAuthHandler(authService service.AuthService, logger *zap.Logger) *AuthHa
 func (h *AuthHandler) Register(c echo.Context) error {
 	var req struct {
 		Username    string `json:"username" validate:"required,min=3,max=50"`
-		Password    string `json:"password" validate:"required,min=12"`
 		Email       string `json:"email" validate:"required,email"`
+		Password    string `json:"password" validate:"required,min=12"`
 		DisplayName string `json:"display_name,omitempty"`
-		InviteCode  string `json:"invite_code,omitempty"`
 	}
 
 	if err := c.Bind(&req); err != nil {
@@ -45,79 +59,81 @@ func (h *AuthHandler) Register(c echo.Context) error {
 	}
 
 	// Validate password strength
-	if len(req.Password) < 12 {
+	if !h.isPasswordStrong(req.Password) {
 		return c.JSON(http.StatusBadRequest, map[string]interface{}{
 			"error":   "weak_password",
-			"message": "Password must be at least 12 characters",
-		})
-	}
-
-	// Check for uppercase letters
-	if !strings.ContainsAny(req.Password, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
-		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "weak_password",
-			"message": "Password must contain at least one uppercase letter",
-		})
-	}
-
-	// Check for numbers
-	if !strings.ContainsAny(req.Password, "0123456789") {
-		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "weak_password",
-			"message": "Password must contain at least one number",
-		})
-	}
-
-	// Check for symbols
-	if !strings.ContainsAny(req.Password, "!@#$%^&*()_+-=[]{}|;:,.<>?") {
-		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "weak_password",
-			"message": "Password must contain at least one symbol",
+			"message": "Password must contain uppercase, lowercase, number, and special character",
 		})
 	}
 
 	ctx := c.Request().Context()
+
+	// Check if user already exists
+	existingUser, _ := h.userRepo.GetByUsername(ctx, req.Username)
+	if existingUser != nil {
+		return c.JSON(http.StatusConflict, map[string]interface{}{
+			"error":   "username_exists",
+			"message": "Username already taken",
+		})
+	}
+
+	existingEmail, _ := h.userRepo.GetByEmail(ctx, req.Email)
+	if existingEmail != nil {
+		return c.JSON(http.StatusConflict, map[string]interface{}{
+			"error":   "email_exists",
+			"message": "Email already registered",
+		})
+	}
+
+	// Create user via auth service
 	registerReq := service.RegisterRequest{
 		Username:    req.Username,
-		Password:    req.Password,
 		Email:       req.Email,
+		Password:    req.Password,
 		DisplayName: req.DisplayName,
 	}
 
 	resp, err := h.authService.Register(ctx, registerReq)
 	if err != nil {
-		h.logger.Error("Registration failed", zap.Error(err))
-
-		if err == service.ErrUserExists {
-			return c.JSON(http.StatusConflict, map[string]interface{}{
-				"error":   "user_exists",
-				"message": "Username or email already exists",
-			})
-		}
-
+		h.logger.Error("Failed to register user", zap.Error(err))
 		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "internal_error",
-			"message": "Failed to create account",
+			"error":   "registration_failed",
+			"message": "Failed to create user account",
 		})
 	}
 
-	// Set secure HTTP-only cookie
-	c.SetCookie(&http.Cookie{
-		Name:     "session_token",
-		Value:    resp.Token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   86400, // 24 hours
-	})
+	// Generate device fingerprint
+	deviceFingerprint := generateDeviceFingerprint(c)
+
+	// Create session
+	session := &models.Session{
+		ID:                uuid.New(),
+		UserID:            resp.User.ID,
+		Token:             resp.Token,
+		UserAgent:         c.Request().UserAgent(),
+		IPAddress:         c.RealIP(),
+		DeviceFingerprint: deviceFingerprint,
+		ExpiresAt:         time.Now().Add(24 * time.Hour),
+		CreatedAt:         time.Now(),
+		LastActivity:      time.Now(),
+	}
+
+	if err := h.sessionRepo.Create(ctx, session); err != nil {
+		h.logger.Error("Failed to create session", zap.Error(err))
+	}
 
 	return c.JSON(http.StatusCreated, map[string]interface{}{
-		"user":         resp.User,
+		"user": map[string]interface{}{
+			"id":           resp.User.ID,
+			"username":     resp.User.MasterUsername,
+			"email":        resp.User.Email,
+			"display_name": resp.User.DisplayName,
+			"created_at":   resp.User.CreatedAt,
+		},
 		"token":        resp.Token,
-		"session_id":   resp.SessionID,
+		"session_id":   session.ID,
 		"expires_in":   86400,
-		"requires_mfa": false,
+		"requires_mfa": resp.User.MFAEnabled,
 	})
 }
 
@@ -126,9 +142,8 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	var req struct {
 		Username   string `json:"username" validate:"required"`
 		Password   string `json:"password" validate:"required"`
-		DeviceName string `json:"device_name,omitempty"`
-		RememberMe bool   `json:"remember_me,omitempty"`
 		MFAToken   string `json:"mfa_token,omitempty"`
+		RememberMe bool   `json:"remember_me,omitempty"`
 	}
 
 	if err := c.Bind(&req); err != nil {
@@ -138,253 +153,169 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		})
 	}
 
-	deviceInfo := service.DeviceInfo{
-		Fingerprint: generateDeviceFingerprint(c),
-		UserAgent:   c.Request().UserAgent(),
-		IPAddress:   c.RealIP(),
-		DeviceName:  req.DeviceName,
-	}
-
-	loginReq := service.LoginRequest{
-		Username:   req.Username,
-		Password:   req.Password,
-		DeviceInfo: deviceInfo,
-		MFAToken:   req.MFAToken,
-	}
-
 	ctx := c.Request().Context()
+
+	// Check if user is locked out
+	user, _ := h.userRepo.GetByUsername(ctx, req.Username)
+	if user == nil {
+		// Try email
+		user, _ = h.userRepo.GetByEmail(ctx, req.Username)
+	}
+
+	if user != nil && user.LockedUntil != nil && user.LockedUntil.After(time.Now()) {
+		remaining := user.LockedUntil.Sub(time.Now())
+		return c.JSON(http.StatusForbidden, map[string]interface{}{
+			"error":       "account_locked",
+			"message":     "Account is temporarily locked",
+			"retry_after": int(remaining.Seconds()),
+		})
+	}
+
+	// Create login request
+	loginReq := service.LoginRequest{
+		Username: req.Username,
+		Password: req.Password,
+		MFAToken: req.MFAToken,
+		DeviceInfo: service.DeviceInfo{
+			UserAgent:   c.Request().UserAgent(),
+			IPAddress:   c.RealIP(),
+			Fingerprint: generateDeviceFingerprint(c),
+		},
+	}
+
 	resp, err := h.authService.Login(ctx, loginReq)
 	if err != nil {
 		h.logger.Error("Login failed", zap.Error(err))
 
-		if err == service.ErrInvalidCredentials {
+		switch err {
+		case service.ErrInvalidCredentials:
+			// Increment failed attempts
+			if user != nil {
+				user.FailedLoginAttempts++
+				if user.FailedLoginAttempts >= 5 {
+					lockout := time.Now().Add(15 * time.Minute)
+					user.LockedUntil = &lockout
+				}
+				h.userRepo.Update(ctx, user)
+			}
+
 			return c.JSON(http.StatusUnauthorized, map[string]interface{}{
 				"error":   "invalid_credentials",
 				"message": "Invalid username or password",
 			})
-		}
-
-		if err == service.ErrAccountLocked {
-			return c.JSON(http.StatusForbidden, map[string]interface{}{
-				"error":   "account_locked",
-				"message": "Account is locked due to too many failed attempts",
-			})
-		}
-
-		if err == service.ErrMFARequired {
+		case service.ErrMFARequired:
 			return c.JSON(http.StatusOK, map[string]interface{}{
 				"requires_mfa": true,
-				"message":      "MFA token required",
+				"message":      "MFA verification required",
 			})
-		}
-
-		if err == service.ErrInvalidMFAToken {
+		case service.ErrInvalidMFAToken:
 			return c.JSON(http.StatusUnauthorized, map[string]interface{}{
 				"error":   "invalid_mfa_token",
 				"message": "Invalid MFA token",
 			})
+		case service.ErrAccountLocked:
+			return c.JSON(http.StatusForbidden, map[string]interface{}{
+				"error":   "account_locked",
+				"message": "Account is locked due to too many failed attempts",
+			})
+		default:
+			return c.JSON(http.StatusInternalServerError, map[string]interface{}{
+				"error":   "login_failed",
+				"message": "Failed to authenticate user",
+			})
 		}
+	}
 
-		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "internal_error",
-			"message": "Login failed",
+	// Set session cookie
+	if req.RememberMe {
+		c.SetCookie(&http.Cookie{
+			Name:     "session_token",
+			Value:    resp.Token,
+			Path:     "/",
+			Expires:  time.Now().Add(30 * 24 * time.Hour), // 30 days
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
 		})
 	}
 
-	// Set cookie based on remember me
-	maxAge := 86400 // 24 hours
-	if req.RememberMe {
-		maxAge = 2592000 // 30 days
-	}
-
-	c.SetCookie(&http.Cookie{
-		Name:     "session_token",
-		Value:    resp.Token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   maxAge,
-	})
-
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"user":           resp.User,
+		"user": map[string]interface{}{
+			"id":           resp.User.ID,
+			"username":     resp.User.MasterUsername,
+			"display_name": resp.User.DisplayName,
+			"email":        resp.User.Email,
+		},
 		"token":          resp.Token,
 		"session_id":     resp.SessionID,
-		"expires_in":     maxAge,
-		"requires_mfa":   false,
+		"expires_in":     86400,
 		"trusted_device": resp.TrustedDevice,
 	})
 }
 
-// Logout handles user logout
-func (h *AuthHandler) Logout(c echo.Context) error {
-	// Get token from cookie or header
-	token := extractToken(c)
-	if token == "" {
-		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "no_token",
-			"message": "No authentication token provided",
-		})
-	}
-
-	// Get session ID from context
-	sessionID := c.Get("session_id")
-	if sessionID == nil {
-		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "no_session",
-			"message": "No active session",
-		})
-	}
-
-	sessionUUID, err := uuid.Parse(sessionID.(string))
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "invalid_session",
-			"message": "Invalid session ID",
-		})
-	}
-
-	ctx := c.Request().Context()
-	if err := h.authService.Logout(ctx, sessionUUID); err != nil {
-		h.logger.Error("Logout failed", zap.Error(err))
-		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "internal_error",
-			"message": "Failed to logout",
-		})
-	}
-
-	// Clear all auth cookies
-	cookies := []string{"session_token", "refresh_token", "mfa_token"}
-	for _, cookieName := range cookies {
-		c.SetCookie(&http.Cookie{
-			Name:     cookieName,
-			Value:    "",
-			Path:     "/",
-			HttpOnly: true,
-			Secure:   true,
-			SameSite: http.SameSiteStrictMode,
-			MaxAge:   -1,
-			Expires:  time.Now().Add(-24 * time.Hour),
-		})
-	}
-
-	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message": "Logged out successfully",
-	})
-}
-
-// RefreshToken handles token refresh
+// RefreshToken refreshes an access token
 func (h *AuthHandler) RefreshToken(c echo.Context) error {
-	// Get refresh token from cookie or body
 	var req struct {
-		RefreshToken string `json:"refresh_token,omitempty"`
+		RefreshToken string `json:"refresh_token" validate:"required"`
 	}
 
-	refreshToken := ""
-	if err := c.Bind(&req); err == nil && req.RefreshToken != "" {
-		refreshToken = req.RefreshToken
-	} else {
-		// Try to get from cookie
-		if cookie, err := c.Cookie("refresh_token"); err == nil {
-			refreshToken = cookie.Value
-		}
-	}
-
-	if refreshToken == "" {
+	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "no_refresh_token",
-			"message": "No refresh token provided",
+			"error":   "invalid_request",
+			"message": "Invalid request format",
 		})
 	}
 
 	ctx := c.Request().Context()
-	newToken, err := h.authService.RefreshToken(ctx, refreshToken)
+	newToken, err := h.authService.RefreshToken(ctx, req.RefreshToken)
 	if err != nil {
-		h.logger.Error("Token refresh failed", zap.Error(err))
 		return c.JSON(http.StatusUnauthorized, map[string]interface{}{
 			"error":   "invalid_refresh_token",
 			"message": "Invalid or expired refresh token",
 		})
 	}
 
-	// Set new session cookie
-	c.SetCookie(&http.Cookie{
-		Name:     "session_token",
-		Value:    newToken,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   86400,
-	})
-
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"token":      newToken,
 		"expires_in": 86400,
-		"token_type": "bearer",
 	})
 }
 
-// VerifyEmail handles email verification
-func (h *AuthHandler) VerifyEmail(c echo.Context) error {
-	var req struct {
-		Token string `json:"token" validate:"required"`
-	}
-
-	if err := c.Bind(&req); err != nil {
+// Logout handles user logout
+func (h *AuthHandler) Logout(c echo.Context) error {
+	token := extractToken(c)
+	if token == "" {
 		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "invalid_request",
-			"message": "Invalid request format",
+			"error":   "no_token",
+			"message": "No authentication token found",
 		})
 	}
 
 	ctx := c.Request().Context()
-	if err := h.authService.VerifyEmail(ctx, req.Token); err != nil {
-		h.logger.Error("Email verification failed", zap.Error(err))
-
-		if err == service.ErrInvalidToken {
-			return c.JSON(http.StatusBadRequest, map[string]interface{}{
-				"error":   "invalid_token",
-				"message": "Invalid or expired verification token",
-			})
-		}
-
-		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "verification_failed",
-			"message": "Failed to verify email",
+	session, err := h.authService.ValidateSession(ctx, token)
+	if err != nil {
+		// Already logged out or invalid token
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"message": "Logged out successfully",
 		})
 	}
 
-	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message": "Email verified successfully",
+	if err := h.authService.Logout(ctx, session.ID); err != nil {
+		h.logger.Error("Failed to logout", zap.Error(err))
+	}
+
+	// Clear cookie
+	c.SetCookie(&http.Cookie{
+		Name:     "session_token",
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Now().Add(-1 * time.Hour),
+		HttpOnly: true,
+		Secure:   true,
 	})
-}
-
-// ResendVerification handles resending verification email
-func (h *AuthHandler) ResendVerification(c echo.Context) error {
-	var req struct {
-		Email string `json:"email" validate:"required,email"`
-	}
-
-	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "invalid_request",
-			"message": "Invalid request format",
-		})
-	}
-
-	ctx := c.Request().Context()
-	if err := h.authService.ResendVerification(ctx, req.Email); err != nil {
-		h.logger.Error("Failed to resend verification", zap.Error(err))
-		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "send_failed",
-			"message": "Failed to send verification email",
-		})
-	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message": "Verification email sent",
+		"message": "Logged out successfully",
 	})
 }
 
@@ -403,22 +334,44 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 
 	ctx := c.Request().Context()
 	if err := h.authService.RequestPasswordReset(ctx, req.Email); err != nil {
-		h.logger.Error("Password reset request failed", zap.Error(err))
-		return c.JSON(http.StatusOK, map[string]interface{}{
-			"message": "If an account exists with this email, a reset link will be sent",
+		// Don't reveal if email exists or not for security
+		h.logger.Debug("Password reset request failed", zap.Error(err))
+	}
+
+	// Always return success to prevent email enumeration
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"message": "If the email exists, a reset link has been sent",
+	})
+}
+
+// VerifyEmail handles email verification
+func (h *AuthHandler) VerifyEmail(c echo.Context) error {
+	token := c.QueryParam("token")
+	if token == "" {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"error":   "missing_token",
+			"message": "Verification token is required",
+		})
+	}
+
+	ctx := c.Request().Context()
+	if err := h.authService.VerifyEmail(ctx, token); err != nil {
+		h.logger.Error("Email verification failed", zap.Error(err))
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"error":   "verification_failed",
+			"message": "Invalid or expired verification token",
 		})
 	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message": "Password reset email sent",
+		"message": "Email verified successfully",
 	})
 }
 
-// VerifyReset handles password reset verification
-func (h *AuthHandler) VerifyReset(c echo.Context) error {
+// ResendVerification resends verification email
+func (h *AuthHandler) ResendVerification(c echo.Context) error {
 	var req struct {
-		Token    string `json:"token" validate:"required"`
-		Password string `json:"password" validate:"required,min=12"`
+		Email string `json:"email" validate:"required,email"`
 	}
 
 	if err := c.Bind(&req); err != nil {
@@ -429,19 +382,44 @@ func (h *AuthHandler) VerifyReset(c echo.Context) error {
 	}
 
 	ctx := c.Request().Context()
-	if err := h.authService.ResetPassword(ctx, req.Token, req.Password); err != nil {
+	if err := h.authService.ResendVerification(ctx, req.Email); err != nil {
+		h.logger.Error("Failed to resend verification", zap.Error(err))
+	}
+
+	// Always return success to prevent email enumeration
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"message": "If the email exists and is not verified, a verification email has been sent",
+	})
+}
+
+// VerifyReset handles password reset verification
+func (h *AuthHandler) VerifyReset(c echo.Context) error {
+	var req struct {
+		Token       string `json:"token" validate:"required"`
+		NewPassword string `json:"new_password" validate:"required,min=12"`
+	}
+
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"error":   "invalid_request",
+			"message": "Invalid request format",
+		})
+	}
+
+	// Validate password strength
+	if !h.isPasswordStrong(req.NewPassword) {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"error":   "weak_password",
+			"message": "Password must contain uppercase, lowercase, number, and special character",
+		})
+	}
+
+	ctx := c.Request().Context()
+	if err := h.authService.ResetPassword(ctx, req.Token, req.NewPassword); err != nil {
 		h.logger.Error("Password reset failed", zap.Error(err))
-
-		if err == service.ErrInvalidToken {
-			return c.JSON(http.StatusBadRequest, map[string]interface{}{
-				"error":   "invalid_token",
-				"message": "Invalid or expired reset token",
-			})
-		}
-
-		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
 			"error":   "reset_failed",
-			"message": "Failed to reset password",
+			"message": "Invalid or expired reset token",
 		})
 	}
 
@@ -456,33 +434,26 @@ func (h *AuthHandler) CheckResetToken(c echo.Context) error {
 	if token == "" {
 		return c.JSON(http.StatusBadRequest, map[string]interface{}{
 			"error":   "missing_token",
-			"message": "No token provided",
+			"message": "Reset token is required",
 		})
 	}
 
 	ctx := c.Request().Context()
 	valid, err := h.authService.ValidateResetToken(ctx, token)
-	if err != nil {
-		h.logger.Error("Token validation failed", zap.Error(err))
-		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "validation_error",
-			"message": "Failed to validate token",
-		})
-	}
-
-	if !valid {
+	if err != nil || !valid {
 		return c.JSON(http.StatusBadRequest, map[string]interface{}{
 			"error":   "invalid_token",
-			"message": "Invalid or expired token",
+			"message": "Invalid or expired reset token",
 		})
 	}
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"valid": true,
+		"valid":   true,
+		"message": "Reset token is valid",
 	})
 }
 
-// GetMFASetup returns MFA setup information
+// GetMFASetup gets MFA setup information
 func (h *AuthHandler) GetMFASetup(c echo.Context) error {
 	userIDStr := c.Get("user_id").(string)
 	userID, err := uuid.Parse(userIDStr)
@@ -494,16 +465,40 @@ func (h *AuthHandler) GetMFASetup(c echo.Context) error {
 	}
 
 	ctx := c.Request().Context()
-	setup, err := h.authService.GetMFASetup(ctx, userID)
+	user, err := h.userRepo.GetByID(ctx, userID)
 	if err != nil {
-		h.logger.Error("Failed to get MFA setup", zap.Error(err))
-		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "mfa_setup_failed",
-			"message": "Failed to get MFA setup",
+		return c.JSON(http.StatusNotFound, map[string]interface{}{
+			"error":   "user_not_found",
+			"message": "User not found",
 		})
 	}
 
-	return c.JSON(http.StatusOK, setup)
+	if user.MFAEnabled {
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"enabled": true,
+			"message": "MFA is already enabled",
+		})
+	}
+
+	// Generate new MFA secret
+	secret, qrCode, err := h.cryptoService.GenerateMFA(user.Email)
+	if err != nil {
+		h.logger.Error("Failed to generate MFA", zap.Error(err))
+		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
+			"error":   "mfa_generation_failed",
+			"message": "Failed to generate MFA setup",
+		})
+	}
+
+	// Store temporary secret in session (in production, use secure storage)
+	c.Set("mfa_temp_secret", secret)
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"enabled": false,
+		"secret":  secret,
+		"qr_code": qrCode,
+		"message": "Scan QR code with authenticator app",
+	})
 }
 
 // VerifyMFASetup verifies MFA setup
@@ -528,29 +523,58 @@ func (h *AuthHandler) VerifyMFASetup(c echo.Context) error {
 		})
 	}
 
-	ctx := c.Request().Context()
-	if err := h.authService.VerifyMFASetup(ctx, userID, req.Token); err != nil {
-		h.logger.Error("MFA setup verification failed", zap.Error(err))
-
-		if err == service.ErrInvalidMFAToken {
-			return c.JSON(http.StatusBadRequest, map[string]interface{}{
-				"error":   "invalid_token",
-				"message": "Invalid token",
-			})
-		}
-
-		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "verification_failed",
-			"message": "Failed to verify MFA setup",
+	secret := c.Get("mfa_temp_secret").(string)
+	if secret == "" {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"error":   "no_mfa_session",
+			"message": "MFA setup session expired",
 		})
 	}
 
+	valid, err := h.cryptoService.VerifyMFA(secret, req.Token)
+	if err != nil || !valid {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"error":   "invalid_mfa_token",
+			"message": "Invalid MFA token",
+		})
+	}
+
+	ctx := c.Request().Context()
+	user, err := h.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return c.JSON(http.StatusNotFound, map[string]interface{}{
+			"error":   "user_not_found",
+			"message": "User not found",
+		})
+	}
+
+	// Enable MFA
+	user.MFAEnabled = true
+	user.MFASecret = secret // Store encrypted in production
+	if err := h.userRepo.Update(ctx, user); err != nil {
+		h.logger.Error("Failed to enable MFA", zap.Error(err))
+		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
+			"error":   "mfa_enable_failed",
+			"message": "Failed to enable MFA",
+		})
+	}
+
+	// Clear temporary secret
+	c.Set("mfa_temp_secret", "")
+
+	// Generate recovery codes
+	recoveryCodes := h.cryptoService.GenerateRecoveryCodes()
+	// Store recovery codes securely (hashed)
+
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message": "MFA enabled successfully",
+		"enabled":        true,
+		"message":        "MFA enabled successfully",
+		"recovery_codes": recoveryCodes,
+		"warning":        "Save these recovery codes in a secure place",
 	})
 }
 
-// DisableMFA disables MFA for a user
+// DisableMFA disables MFA
 func (h *AuthHandler) DisableMFA(c echo.Context) error {
 	userIDStr := c.Get("user_id").(string)
 	userID, err := uuid.Parse(userIDStr)
@@ -561,30 +585,27 @@ func (h *AuthHandler) DisableMFA(c echo.Context) error {
 		})
 	}
 
-	var req struct {
-		Token string `json:"token" validate:"required"`
-	}
-
-	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]interface{}{
-			"error":   "invalid_request",
-			"message": "Invalid request format",
+	ctx := c.Request().Context()
+	user, err := h.userRepo.GetByID(ctx, userID)
+	if err != nil {
+		return c.JSON(http.StatusNotFound, map[string]interface{}{
+			"error":   "user_not_found",
+			"message": "User not found",
 		})
 	}
 
-	ctx := c.Request().Context()
-	if err := h.authService.DisableMFA(ctx, userID, req.Token); err != nil {
+	if !user.MFAEnabled {
+		return c.JSON(http.StatusOK, map[string]interface{}{
+			"message": "MFA is already disabled",
+		})
+	}
+
+	user.MFAEnabled = false
+	user.MFASecret = ""
+	if err := h.userRepo.Update(ctx, user); err != nil {
 		h.logger.Error("Failed to disable MFA", zap.Error(err))
-
-		if err == service.ErrInvalidMFAToken {
-			return c.JSON(http.StatusBadRequest, map[string]interface{}{
-				"error":   "invalid_token",
-				"message": "Invalid token",
-			})
-		}
-
 		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "disable_failed",
+			"error":   "mfa_disable_failed",
 			"message": "Failed to disable MFA",
 		})
 	}
@@ -594,7 +615,7 @@ func (h *AuthHandler) DisableMFA(c echo.Context) error {
 	})
 }
 
-// GetRecoveryCodes generates recovery codes for MFA
+// GetRecoveryCodes gets MFA recovery codes
 func (h *AuthHandler) GetRecoveryCodes(c echo.Context) error {
 	userIDStr := c.Get("user_id").(string)
 	userID, err := uuid.Parse(userIDStr)
@@ -606,18 +627,35 @@ func (h *AuthHandler) GetRecoveryCodes(c echo.Context) error {
 	}
 
 	ctx := c.Request().Context()
-	codes, err := h.authService.GenerateRecoveryCodes(ctx, userID)
+	user, err := h.userRepo.GetByID(ctx, userID)
 	if err != nil {
-		h.logger.Error("Failed to generate recovery codes", zap.Error(err))
-		return c.JSON(http.StatusInternalServerError, map[string]interface{}{
-			"error":   "generation_failed",
-			"message": "Failed to generate recovery codes",
+		return c.JSON(http.StatusNotFound, map[string]interface{}{
+			"error":   "user_not_found",
+			"message": "User not found",
 		})
 	}
 
+	if !user.MFAEnabled {
+		return c.JSON(http.StatusBadRequest, map[string]interface{}{
+			"error":   "mfa_not_enabled",
+			"message": "MFA is not enabled",
+		})
+	}
+
+	// In production, fetch from secure storage
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"codes": codes,
+		"message": "Recovery codes should be stored securely during setup",
 	})
+}
+
+// ValidateToken validates a session token
+func (h *AuthHandler) ValidateToken(ctx context.Context, token string) (*models.Session, error) {
+	return h.authService.ValidateSession(ctx, token)
+}
+
+// IsAdmin checks if user has admin privileges
+func (h *AuthHandler) IsAdmin(ctx context.Context, userID uuid.UUID) (bool, error) {
+	return h.authService.IsAdmin(ctx, userID)
 }
 
 // Helper functions
@@ -644,6 +682,33 @@ func generateDeviceFingerprint(c echo.Context) string {
 	acceptEnc := c.Request().Header.Get("Accept-Encoding")
 
 	fingerprint := userAgent + acceptLang + acceptEnc
-	hash := crypto.HashToken(fingerprint)
-	return hash
+	// In production, use proper hashing
+	return fingerprint
+}
+
+func (h *AuthHandler) isPasswordStrong(password string) bool {
+	if len(password) < 12 {
+		return false
+	}
+
+	hasUpper := false
+	hasLower := false
+	hasDigit := false
+	hasSpecial := false
+	specialChars := "!@#$%^&*()_+-=[]{}|;:,.<>?"
+
+	for _, char := range password {
+		switch {
+		case 'A' <= char && char <= 'Z':
+			hasUpper = true
+		case 'a' <= char && char <= 'z':
+			hasLower = true
+		case '0' <= char && char <= '9':
+			hasDigit = true
+		case strings.ContainsRune(specialChars, char):
+			hasSpecial = true
+		}
+	}
+
+	return hasUpper && hasLower && hasDigit && hasSpecial
 }

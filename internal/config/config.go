@@ -1,196 +1,15 @@
+// internal/config/config.go
 package config
 
 import (
 	"fmt"
 	"os"
-	"strconv"
-	"strings"
+	"path/filepath"
 	"time"
 
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
 )
-
-// overrideWithEnv overrides configuration with environment variables
-func overrideWithEnv(cfg *Config) {
-	// Server
-	if v := getEnv("SERVER_HOST", ""); v != "" {
-		cfg.Server.Host = v
-	}
-	if v := getEnv("SERVER_PORT", ""); v != "" {
-		cfg.Server.Port = parseInt(v, cfg.Server.Port)
-	}
-	if v := getEnv("SERVER_TLS_ENABLED", ""); v != "" {
-		cfg.Server.TLSEnabled = parseBool(v)
-	}
-
-	// Database
-	if v := getEnv("DATABASE_HOST", ""); v != "" {
-		cfg.Database.Host = v
-	}
-	if v := getEnv("DATABASE_PORT", ""); v != "" {
-		cfg.Database.Port = parseInt(v, cfg.Database.Port)
-	}
-	if v := getEnv("DATABASE_USER", ""); v != "" {
-		cfg.Database.User = v
-	}
-	if v := getEnv("DATABASE_PASSWORD", ""); v != "" {
-		cfg.Database.Password = v
-	}
-	if v := getEnv("DATABASE_NAME", ""); v != "" {
-		cfg.Database.Database = v
-	}
-
-	// Security
-	if v := getEnv("JWT_SECRET", ""); v != "" {
-		cfg.Security.JWTSecret = v
-	}
-	if v := getEnv("JWT_EXPIRATION", ""); v != "" {
-		cfg.Security.JWTExpiration = parseDuration(v, cfg.Security.JWTExpiration)
-	}
-	if v := getEnv("ENCRYPTION_KEY", ""); v != "" {
-		cfg.Security.EncryptionKey = []byte(v)
-	}
-
-	// Email
-	if v := getEnv("EMAIL_DOMAIN", ""); v != "" {
-		cfg.Email.Domain = v
-	}
-
-	// Network
-	if v := getEnv("ENABLE_I2P", ""); v != "" {
-		cfg.Network.EnableI2P = parseBool(v)
-	}
-	if v := getEnv("ENABLE_TOR", ""); v != "" {
-		cfg.Network.EnableTor = parseBool(v)
-	}
-
-	// Storage
-	if v := getEnv("STORAGE_BACKEND", ""); v != "" {
-		cfg.Storage.Backend = v
-	}
-	if v := getEnv("STORAGE_LOCAL_PATH", ""); v != "" {
-		cfg.Storage.LocalPath = v
-	}
-
-	// Logging
-	if v := getEnv("LOG_LEVEL", ""); v != "" {
-		cfg.Logging.Level = v
-	}
-	if v := getEnv("LOG_FORMAT", ""); v != "" {
-		cfg.Logging.Format = v
-	}
-}
-
-// validateConfig validates the configuration
-func validateConfig(cfg *Config) error {
-	// Server validation
-	if cfg.Server.Port <= 0 || cfg.Server.Port > 65535 {
-		return fmt.Errorf("invalid server port: %d", cfg.Server.Port)
-	}
-
-	// Database validation
-	if cfg.Database.Host == "" {
-		return fmt.Errorf("database host is required")
-	}
-	if cfg.Database.Port <= 0 || cfg.Database.Port > 65535 {
-		return fmt.Errorf("invalid database port: %d", cfg.Database.Port)
-	}
-
-	// Security validation
-	if len(cfg.Security.JWTSecret) < 32 {
-		return fmt.Errorf("JWT secret must be at least 32 characters")
-	}
-	if cfg.Security.JWTExpiration <= 0 {
-		return fmt.Errorf("JWT expiration must be positive")
-	}
-	if len(cfg.Security.EncryptionKey) < 32 {
-		return fmt.Errorf("encryption key must be at least 32 bytes")
-	}
-
-	// Email validation
-	if cfg.Email.Domain == "" {
-		return fmt.Errorf("email domain is required")
-	}
-
-	// Storage validation
-	if cfg.Storage.LocalPath == "" {
-		return fmt.Errorf("storage local path is required")
-	}
-
-	return nil
-}
-
-// Helper functions
-func getEnv(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return defaultValue
-}
-
-func parseInt(s string, defaultValue int) int {
-	if s == "" {
-		return defaultValue
-	}
-	value, err := strconv.Atoi(s)
-	if err != nil {
-		return defaultValue
-	}
-	return value
-}
-
-func parseBool(s string) bool {
-	if s == "" {
-		return false
-	}
-	value, err := strconv.ParseBool(s)
-	if err != nil {
-		return false
-	}
-	return value
-}
-
-func parseDuration(s string, defaultValue time.Duration) time.Duration {
-	if s == "" {
-		return defaultValue
-	}
-	duration, err := time.ParseDuration(s)
-	if err != nil {
-		return defaultValue
-	}
-	return duration
-}
-
-// LoadFromBytes loads configuration from YAML bytes
-func LoadFromBytes(data []byte) (*Config, error) {
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse YAML config: %w", err)
-	}
-	return &cfg, nil
-}
-
-// String returns a string representation of the config (with sensitive data redacted)
-func (c *Config) String() string {
-	cfg := *c
-	cfg.Database.Password = "[REDACTED]"
-	cfg.Security.JWTSecret = "[REDACTED]"
-	cfg.Security.EncryptionKey = []byte("[REDACTED]")
-
-	data, _ := yaml.Marshal(cfg)
-	return string(data)
-}
-
-// IsDevelopment returns true if running in development mode
-func (c *Config) IsDevelopment() bool {
-	return strings.ToLower(getEnv("ENVIRONMENT", "production")) == "development"
-}
-
-// IsProduction returns true if running in production mode
-func (c *Config) IsProduction() bool {
-	return strings.ToLower(getEnv("ENVIRONMENT", "production")) == "production"
-}
 
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
@@ -200,20 +19,32 @@ type Config struct {
 	Network  NetworkConfig  `yaml:"network"`
 	Storage  StorageConfig  `yaml:"storage"`
 	Logging  LoggingConfig  `yaml:"logging"`
+	Redis    RedisConfig    `yaml:"redis"`
 }
 
-// ServerConfig contains server configuration
 type ServerConfig struct {
 	Host         string        `yaml:"host"`
 	Port         int           `yaml:"port"`
 	ReadTimeout  time.Duration `yaml:"read_timeout"`
 	WriteTimeout time.Duration `yaml:"write_timeout"`
-	TLSEnabled   bool          `yaml:"tls_enabled"`
-	TLSCertPath  string        `yaml:"tls_cert_path"`
-	TLSKeyPath   string        `yaml:"tls_key_path"`
+	TLS          TLSConfig     `yaml:"tls"`
+	CORS         CORSConfig    `yaml:"cors"`
 }
 
-// DatabaseConfig contains database configuration
+type TLSConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	CertPath string `yaml:"cert_path"`
+	KeyPath  string `yaml:"key_path"`
+}
+
+type CORSConfig struct {
+	AllowedOrigins   []string `yaml:"allowed_origins"`
+	AllowedMethods   []string `yaml:"allowed_methods"`
+	AllowedHeaders   []string `yaml:"allowed_headers"`
+	AllowCredentials bool     `yaml:"allow_credentials"`
+	MaxAge           int      `yaml:"max_age"`
+}
+
 type DatabaseConfig struct {
 	Host            string        `yaml:"host"`
 	Port            int           `yaml:"port"`
@@ -224,53 +55,84 @@ type DatabaseConfig struct {
 	MaxOpenConns    int           `yaml:"max_open_conns"`
 	MaxIdleConns    int           `yaml:"max_idle_conns"`
 	ConnMaxLifetime time.Duration `yaml:"conn_max_lifetime"`
+	ConnMaxIdleTime time.Duration `yaml:"conn_max_idle_time"`
 }
 
-// SecurityConfig contains security configuration
 type SecurityConfig struct {
-	JWTSecret             string        `yaml:"jwt_secret"`
-	JWTExpiration         time.Duration `yaml:"jwt_expiration"`
-	EncryptionKey         []byte        `yaml:"encryption_key"`
-	PasswordMinLength     int           `yaml:"password_min_length"`
-	PasswordRequireSymbol bool          `yaml:"password_require_symbol"`
-	PasswordRequireNumber bool          `yaml:"password_require_number"`
-	PasswordRequireUpper  bool          `yaml:"password_require_upper"`
-	MaxLoginAttempts      int           `yaml:"max_login_attempts"`
-	LockoutDuration       time.Duration `yaml:"lockout_duration"`
+	JWTSecret             string          `yaml:"jwt_secret"`
+	JWTExpiration         time.Duration   `yaml:"jwt_expiration"`
+	EncryptionKey         string          `yaml:"encryption_key"`
+	PasswordMinLength     int             `yaml:"password_min_length"`
+	PasswordRequireSymbol bool            `yaml:"password_require_symbol"`
+	PasswordRequireNumber bool            `yaml:"password_require_number"`
+	PasswordRequireUpper  bool            `yaml:"password_require_upper"`
+	MaxLoginAttempts      int             `yaml:"max_login_attempts"`
+	LockoutDuration       time.Duration   `yaml:"lockout_duration"`
+	RateLimit             RateLimitConfig `yaml:"rate_limit"`
 }
 
-// EmailConfig contains email configuration
+type RateLimitConfig struct {
+	RequestsPerMinute int `yaml:"requests_per_minute"`
+	Burst             int `yaml:"burst"`
+}
+
 type EmailConfig struct {
-	Domain         string `yaml:"domain"`
-	SMTPPort       int    `yaml:"smtp_port"`
-	SMTPSPort      int    `yaml:"smtps_port"`
-	IMAPPort       int    `yaml:"imap_port"`
-	POP3Port       int    `yaml:"pop3_port"`
-	MaxMessageSize int64  `yaml:"max_message_size"`
-	EnableDKIM     bool   `yaml:"enable_dkim"`
-	EnableSPF      bool   `yaml:"enable_spf"`
-	EnableDMARC    bool   `yaml:"enable_dmarc"`
-	DKIMSelector   string `yaml:"dkim_selector"`
+	Domain            string        `yaml:"domain"`
+	SMTPPort          int           `yaml:"smtp_port"`
+	SMTPSPort         int           `yaml:"smtps_port"`
+	IMAPPort          int           `yaml:"imap_port"`
+	POP3Port          int           `yaml:"pop3_port"`
+	MaxMessageSize    int64         `yaml:"max_message_size"`
+	EnableDKIM        bool          `yaml:"enable_dkim"`
+	EnableSPF         bool          `yaml:"enable_spf"`
+	EnableDMARC       bool          `yaml:"enable_dmarc"`
+	DKIMSelector      string        `yaml:"dkim_selector"`
+	DKIMPrivateKey    string        `yaml:"dkim_private_key"`
+	DefaultFrom       string        `yaml:"default_from"`
+	VerificationEmail EmailTemplate `yaml:"verification_email"`
+	ResetEmail        EmailTemplate `yaml:"reset_email"`
 }
 
-// NetworkConfig contains network configuration
+type EmailTemplate struct {
+	Subject string `yaml:"subject"`
+	Body    string `yaml:"body"`
+}
+
 type NetworkConfig struct {
-	EnableI2P     bool   `yaml:"enable_i2p"`
-	I2PRouterHost string `yaml:"i2p_router_host"`
-	I2PRouterPort int    `yaml:"i2p_router_port"`
-	EnableTor     bool   `yaml:"enable_tor"`
-	TorProxyHost  string `yaml:"tor_proxy_host"`
-	TorProxyPort  int    `yaml:"tor_proxy_port"`
+	EnableI2P      bool   `yaml:"enable_i2p"`
+	I2PRouterHost  string `yaml:"i2p_router_host"`
+	I2PRouterPort  int    `yaml:"i2p_router_port"`
+	EnableTor      bool   `yaml:"enable_tor"`
+	TorProxyHost   string `yaml:"tor_proxy_host"`
+	TorProxyPort   int    `yaml:"tor_proxy_port"`
+	EnableIPFS     bool   `yaml:"enable_ipfs"`
+	IPFSGateway    string `yaml:"ipfs_gateway"`
+	DefaultNetwork string `yaml:"default_network"`
 }
 
-// StorageConfig contains storage configuration
 type StorageConfig struct {
-	Backend     string `yaml:"backend"`
-	LocalPath   string `yaml:"local_path"`
-	MaxFileSize int64  `yaml:"max_file_size"`
+	Backend     string     `yaml:"backend"`
+	LocalPath   string     `yaml:"local_path"`
+	S3          S3Config   `yaml:"s3"`
+	IPFS        IPFSConfig `yaml:"ipfs"`
+	MaxFileSize int64      `yaml:"max_file_size"`
+	Encryption  bool       `yaml:"encryption"`
 }
 
-// LoggingConfig contains logging configuration
+type S3Config struct {
+	Endpoint  string `yaml:"endpoint"`
+	Bucket    string `yaml:"bucket"`
+	Region    string `yaml:"region"`
+	AccessKey string `yaml:"access_key"`
+	SecretKey string `yaml:"secret_key"`
+	UseSSL    bool   `yaml:"use_ssl"`
+}
+
+type IPFSConfig struct {
+	Gateway    string `yaml:"gateway"`
+	APIAddress string `yaml:"api_address"`
+}
+
 type LoggingConfig struct {
 	Level      string `yaml:"level"`
 	Format     string `yaml:"format"`
@@ -282,64 +144,294 @@ type LoggingConfig struct {
 	Compress   bool   `yaml:"compress"`
 }
 
-// Load loads configuration from file and environment variables
-func Load() (*Config, error) {
-	// Load .env file if it exists
-	_ = godotenv.Load()
-
-	// Read config file
-	configPath := os.Getenv("CONFIG_PATH")
-	if configPath == "" {
-		configPath = "config.yml"
-	}
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
-	}
-
-	// Override with environment variables if present
-	overrideFromEnv(&cfg)
-
-	return &cfg, nil
+type RedisConfig struct {
+	Host     string `yaml:"host"`
+	Port     int    `yaml:"port"`
+	Password string `yaml:"password"`
+	DB       int    `yaml:"db"`
 }
 
-// overrideFromEnv overrides configuration with environment variables
+// Load loads configuration from file and environment variables
+func Load() (*Config, error) {
+	// Load .env file if exists
+	if err := godotenv.Load(); err != nil {
+		fmt.Println("Warning: .env file not found, using environment variables only")
+	}
+
+	// Default config
+	config := &Config{
+		Server: ServerConfig{
+			Host:         "0.0.0.0",
+			Port:         8080,
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 30 * time.Second,
+			TLS: TLSConfig{
+				Enabled: false,
+			},
+			CORS: CORSConfig{
+				AllowedOrigins:   []string{"*"},
+				AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+				AllowedHeaders:   []string{"*"},
+				AllowCredentials: true,
+				MaxAge:           86400,
+			},
+		},
+		Database: DatabaseConfig{
+			Host:            "localhost",
+			Port:            5432,
+			User:            "mxil",
+			Database:        "mxil",
+			SSLMode:         "disable",
+			MaxOpenConns:    25,
+			MaxIdleConns:    5,
+			ConnMaxLifetime: 5 * time.Minute,
+			ConnMaxIdleTime: 1 * time.Minute,
+		},
+		Security: SecurityConfig{
+			PasswordMinLength:     12,
+			PasswordRequireSymbol: true,
+			PasswordRequireNumber: true,
+			PasswordRequireUpper:  true,
+			MaxLoginAttempts:      5,
+			LockoutDuration:       15 * time.Minute,
+			JWTExpiration:         24 * time.Hour,
+			RateLimit: RateLimitConfig{
+				RequestsPerMinute: 60,
+				Burst:             100,
+			},
+		},
+		Email: EmailConfig{
+			Domain:         "mxil.example.com",
+			SMTPPort:       587,
+			SMTPSPort:      465,
+			IMAPPort:       993,
+			POP3Port:       995,
+			MaxMessageSize: 52428800,
+			EnableDKIM:     true,
+			EnableSPF:      true,
+			EnableDMARC:    true,
+			DKIMSelector:   "default",
+			DefaultFrom:    "noreply@mxil.example.com",
+			VerificationEmail: EmailTemplate{
+				Subject: "Verify your MXIL account",
+				Body:    "Click the link to verify your account: {{.URL}}",
+			},
+			ResetEmail: EmailTemplate{
+				Subject: "Reset your MXIL password",
+				Body:    "Click the link to reset your password: {{.URL}}",
+			},
+		},
+		Network: NetworkConfig{
+			EnableI2P:      false,
+			I2PRouterHost:  "localhost",
+			I2PRouterPort:  7657,
+			EnableTor:      false,
+			TorProxyHost:   "localhost",
+			TorProxyPort:   9050,
+			EnableIPFS:     false,
+			IPFSGateway:    "https://ipfs.io",
+			DefaultNetwork: "clearnet",
+		},
+		Storage: StorageConfig{
+			Backend:     "local",
+			LocalPath:   "./data/storage",
+			MaxFileSize: 104857600,
+			Encryption:  true,
+			S3: S3Config{
+				Region: "us-east-1",
+				UseSSL: true,
+			},
+			IPFS: IPFSConfig{
+				Gateway:    "https://ipfs.io",
+				APIAddress: "/ip4/127.0.0.1/tcp/5001",
+			},
+		},
+		Logging: LoggingConfig{
+			Level:      "info",
+			Format:     "json",
+			Output:     "stdout",
+			FilePath:   "./logs/mxil.log",
+			MaxSize:    100,
+			MaxBackups: 3,
+			MaxAge:     28,
+			Compress:   true,
+		},
+		Redis: RedisConfig{
+			Host: "localhost",
+			Port: 6379,
+			DB:   0,
+		},
+	}
+
+	// Load from config file if exists
+	configPaths := []string{
+		"config.yml",
+		"config/config.yml",
+		"/etc/mxil/config.yml",
+		filepath.Join(os.Getenv("HOME"), ".mxil", "config.yml"),
+	}
+
+	var configFile string
+	for _, path := range configPaths {
+		if _, err := os.Stat(path); err == nil {
+			configFile = path
+			break
+		}
+	}
+
+	if configFile != "" {
+		data, err := os.ReadFile(configFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read config file: %w", err)
+		}
+
+		if err := yaml.Unmarshal(data, config); err != nil {
+			return nil, fmt.Errorf("failed to parse config file: %w", err)
+		}
+	}
+
+	// Override with environment variables
+	overrideFromEnv(config)
+
+	// Validate configuration
+	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
 func overrideFromEnv(cfg *Config) {
-	if host := os.Getenv("SERVER_HOST"); host != "" {
-		cfg.Server.Host = host
+	// Server
+	if v := os.Getenv("SERVER_HOST"); v != "" {
+		cfg.Server.Host = v
 	}
-	if port := os.Getenv("SERVER_PORT"); port != "" {
-		fmt.Sscanf(port, "%d", &cfg.Server.Port)
-	}
-
-	// Database overrides
-	if host := os.Getenv("DATABASE_HOST"); host != "" {
-		cfg.Database.Host = host
-	}
-	if port := os.Getenv("DATABASE_PORT"); port != "" {
-		fmt.Sscanf(port, "%d", &cfg.Database.Port)
-	}
-	if user := os.Getenv("DATABASE_USER"); user != "" {
-		cfg.Database.User = user
-	}
-	if password := os.Getenv("DATABASE_PASSWORD"); password != "" {
-		cfg.Database.Password = password
-	}
-	if database := os.Getenv("DATABASE_NAME"); database != "" {
-		cfg.Database.Database = database
+	if v := os.Getenv("SERVER_PORT"); v != "" {
+		port := 0
+		fmt.Sscanf(v, "%d", &port)
+		if port > 0 {
+			cfg.Server.Port = port
+		}
 	}
 
-	// Security overrides
-	if secret := os.Getenv("JWT_SECRET"); secret != "" {
-		cfg.Security.JWTSecret = secret
+	// Database
+	if v := os.Getenv("DATABASE_HOST"); v != "" {
+		cfg.Database.Host = v
 	}
-	if key := os.Getenv("ENCRYPTION_KEY"); key != "" {
-		cfg.Security.EncryptionKey = []byte(key)
+	if v := os.Getenv("DATABASE_PORT"); v != "" {
+		port := 0
+		fmt.Sscanf(v, "%d", &port)
+		if port > 0 {
+			cfg.Database.Port = port
+		}
 	}
+	if v := os.Getenv("DATABASE_USER"); v != "" {
+		cfg.Database.User = v
+	}
+	if v := os.Getenv("DATABASE_PASSWORD"); v != "" {
+		cfg.Database.Password = v
+	}
+	if v := os.Getenv("DATABASE_NAME"); v != "" {
+		cfg.Database.Database = v
+	}
+	if v := os.Getenv("DATABASE_SSL_MODE"); v != "" {
+		cfg.Database.SSLMode = v
+	}
+
+	// Security
+	if v := os.Getenv("JWT_SECRET"); v != "" {
+		cfg.Security.JWTSecret = v
+	}
+	if v := os.Getenv("ENCRYPTION_KEY"); v != "" {
+		cfg.Security.EncryptionKey = v
+	}
+	if v := os.Getenv("JWT_EXPIRATION"); v != "" {
+		if dur, err := time.ParseDuration(v); err == nil {
+			cfg.Security.JWTExpiration = dur
+		}
+	}
+
+	// Email
+	if v := os.Getenv("EMAIL_DOMAIN"); v != "" {
+		cfg.Email.Domain = v
+	}
+	if v := os.Getenv("DEFAULT_FROM"); v != "" {
+		cfg.Email.DefaultFrom = v
+	}
+
+	// Network
+	if v := os.Getenv("ENABLE_I2P"); v != "" {
+		cfg.Network.EnableI2P = v == "true"
+	}
+	if v := os.Getenv("ENABLE_TOR"); v != "" {
+		cfg.Network.EnableTor = v == "true"
+	}
+
+	// Storage
+	if v := os.Getenv("STORAGE_BACKEND"); v != "" {
+		cfg.Storage.Backend = v
+	}
+	if v := os.Getenv("STORAGE_PATH"); v != "" {
+		cfg.Storage.LocalPath = v
+	}
+
+	// Redis
+	if v := os.Getenv("REDIS_HOST"); v != "" {
+		cfg.Redis.Host = v
+	}
+	if v := os.Getenv("REDIS_PORT"); v != "" {
+		port := 0
+		fmt.Sscanf(v, "%d", &port)
+		if port > 0 {
+			cfg.Redis.Port = port
+		}
+	}
+	if v := os.Getenv("REDIS_PASSWORD"); v != "" {
+		cfg.Redis.Password = v
+	}
+}
+
+func validateConfig(cfg *Config) error {
+	// Validate security settings
+	if cfg.Security.JWTSecret == "" || cfg.Security.JWTSecret == "change_me_to_random_string_at_least_32_chars" {
+		return fmt.Errorf("JWT secret must be set and secure")
+	}
+	if cfg.Security.EncryptionKey == "" || cfg.Security.EncryptionKey == "32_byte_encryption_key_change_me_in_production" {
+		return fmt.Errorf("encryption key must be set and secure")
+	}
+	if len(cfg.Security.JWTSecret) < 32 {
+		return fmt.Errorf("JWT secret must be at least 32 characters")
+	}
+
+	// Validate database settings
+	if cfg.Database.Host == "" {
+		return fmt.Errorf("database host is required")
+	}
+	if cfg.Database.User == "" {
+		return fmt.Errorf("database user is required")
+	}
+	if cfg.Database.Password == "" {
+		return fmt.Errorf("database password is required")
+	}
+	if cfg.Database.Database == "" {
+		return fmt.Errorf("database name is required")
+	}
+
+	// Validate email settings
+	if cfg.Email.Domain == "" || cfg.Email.Domain == "mxil.example.com" {
+		return fmt.Errorf("email domain must be configured")
+	}
+
+	return nil
+}
+
+// GetDSN returns database connection string
+func (c *DatabaseConfig) GetDSN() string {
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		c.Host, c.Port, c.User, c.Password, c.Database, c.SSLMode)
+}
+
+// GetRedisAddr returns Redis address
+func (c *RedisConfig) GetAddr() string {
+	return fmt.Sprintf("%s:%d", c.Host, c.Port)
 }

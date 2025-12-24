@@ -5,10 +5,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/okavatti/mxil-server/m/internal/repository"
-	authservice "github.com/okavatti/mxil-server/m/internal/service/auth"
-	cryptoservice "github.com/okavatti/mxil-server/m/internal/service/crypto"
-	emailservice "github.com/okavatti/mxil-server/m/internal/service/email"
-	networkservice "github.com/okavatti/mxil-server/m/internal/service/network"
+	"github.com/okavatti/mxil-server/m/internal/service"
 )
 
 // Handlers contains all HTTP handlers
@@ -29,10 +26,10 @@ type Handlers struct {
 
 // NewHandlers creates all HTTP handlers
 func NewHandlers(
-	authService authservice.AuthService,
-	emailService emailservice.EmailService,
-	networkService networkservice.NetworkService,
-	cryptoService cryptoservice.CryptoService,
+	authService service.AuthService,
+	emailService service.EmailService,
+	networkService service.NetworkService,
+	cryptoService service.CryptoService,
 	userRepo *repository.UserRepository,
 	emailRepo *repository.EmailRepository,
 	sessionRepo *repository.SessionRepository,
@@ -43,10 +40,11 @@ func NewHandlers(
 	providerRepo *repository.ProviderBridgeRepository,
 	keyRepo *repository.EncryptionKeyRepository,
 	statsRepo *repository.StatsRepository,
+	auditRepo *repository.AuditRepository,
 	logger *zap.Logger,
 ) *Handlers {
 	// Initialize individual handlers
-	authHandler := NewAuthHandler(authService, logger)
+	authHandler := NewAuthHandler(authService, userRepo, sessionRepo, cryptoService, logger)
 	emailHandler := NewEmailHandler(emailService, emailRepo, userRepo, logger)
 	userHandler := NewUserHandler(userRepo, sessionRepo, authService, logger)
 	folderHandler := NewFolderHandler(folderRepo, emailRepo, logger)

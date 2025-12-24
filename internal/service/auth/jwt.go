@@ -1,4 +1,4 @@
-// internal/auth/jwt_service.go
+// internal/service/jwt_service.go
 package auth
 
 import (
@@ -9,10 +9,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// JWTService handles JWT operations
-type JWTService struct {
-	secret     string
-	expiration time.Duration
+// JWTService interface
+type JWTService interface {
+	GenerateToken(userID uuid.UUID, username string) (string, error)
+	ValidateToken(tokenString string) (*JWTClaims, error)
 }
 
 // JWTClaims custom claims
@@ -22,16 +22,22 @@ type JWTClaims struct {
 	jwt.RegisteredClaims
 }
 
+// jwtServiceImpl implements JWTService
+type jwtServiceImpl struct {
+	secret     string
+	expiration time.Duration
+}
+
 // NewJWTService creates a new JWT service
-func NewJWTService(secret string, expiration time.Duration) *JWTService {
-	return &JWTService{
+func NewJWTService(secret string, expiration time.Duration) JWTService {
+	return &jwtServiceImpl{
 		secret:     secret,
 		expiration: expiration,
 	}
 }
 
 // GenerateToken generates a JWT token
-func (s *JWTService) GenerateToken(userID uuid.UUID, username string) (string, error) {
+func (s *jwtServiceImpl) GenerateToken(userID uuid.UUID, username string) (string, error) {
 	claims := JWTClaims{
 		UserID:   userID,
 		Username: username,
@@ -48,7 +54,7 @@ func (s *JWTService) GenerateToken(userID uuid.UUID, username string) (string, e
 }
 
 // ValidateToken validates a JWT token
-func (s *JWTService) ValidateToken(tokenString string) (*JWTClaims, error) {
+func (s *jwtServiceImpl) ValidateToken(tokenString string) (*JWTClaims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])

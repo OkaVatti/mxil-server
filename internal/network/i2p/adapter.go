@@ -104,11 +104,11 @@ func (a *I2PAdapter) Send(ctx context.Context, email *models.Email) error {
 	}
 
 	// Get first recipient (for now)
-	if len(email.ToAddresses) == 0 {
+	if len(email.To) == 0 {
 		return fmt.Errorf("no recipients")
 	}
 
-	recipient := email.ToAddresses[0]
+	recipient := email.To[0]
 	if !strings.HasSuffix(recipient, ".i2p") && !strings.Contains(recipient, ".b32.i2p") {
 		return fmt.Errorf("invalid I2P address: %s", recipient)
 	}
@@ -221,7 +221,7 @@ func (a *I2PAdapter) handleConnection(ctx context.Context, conn net.Conn, emailC
 
 	// Set remote address
 	if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
-		email.FromAddress = remoteAddr.String()
+		email.From = remoteAddr.String()
 	}
 
 	select {
@@ -262,8 +262,8 @@ func (a *I2PAdapter) buildI2PMessage(email *models.Email) string {
 	var builder strings.Builder
 
 	builder.WriteString("I2P-EMAIL-V1\n")
-	builder.WriteString(fmt.Sprintf("From: %s\n", email.FromAddress))
-	builder.WriteString(fmt.Sprintf("To: %s\n", strings.Join(email.ToAddresses, ", ")))
+	builder.WriteString(fmt.Sprintf("From: %s\n", email.From))
+	builder.WriteString(fmt.Sprintf("To: %s\n", strings.Join(email.To, ", ")))
 	builder.WriteString(fmt.Sprintf("Subject: %s\n", email.Subject))
 	builder.WriteString(fmt.Sprintf("Message-ID: %s\n", email.MessageID))
 	builder.WriteString(fmt.Sprintf("Date: %s\n", time.Now().Format(time.RFC1123Z)))
@@ -314,9 +314,9 @@ func (a *I2PAdapter) parseI2PMessage(raw string) *models.Email {
 
 				switch key {
 				case "From":
-					email.FromAddress = value
+					email.From = value
 				case "To":
-					email.ToAddresses = models.StringArray(strings.Split(value, ", "))
+					email.To = models.StringArray(strings.Split(value, ", "))
 				case "Subject":
 					email.Subject = value
 				case "Message-ID":

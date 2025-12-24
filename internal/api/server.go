@@ -13,23 +13,25 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/okavatti/mxil-server/m/internal/api/handlers"
-	"github.com/okavatti/mxil-server/m/internal/api/middleware"
-	"github.com/okavatti/mxil-server/m/internal/auth"
+	apimiddleware "github.com/okavatti/mxil-server/m/internal/api/middleware"
 	"github.com/okavatti/mxil-server/m/internal/config"
+	"github.com/okavatti/mxil-server/m/internal/service"
 )
 
 // Server represents the HTTP server
 type Server struct {
-	echo       *echo.Echo
-	cfg        *config.Config
-	logger     *zap.Logger
-	handlers   *handlers.Handlers
-	jwtService *auth.JWTService
-	httpServer *http.Server
+	echo        *echo.Echo
+	cfg         *config.Config
+	logger      *zap.Logger
+	handlers    *handlers.Handlers
+	jwtService  service.JWTService
+	authService service.AuthService
+	httpServer  *http.Server
 }
 
 // NewServer creates a new server instance
-func NewServer(cfg *config.Config, logger *zap.Logger, handlers *handlers.Handlers, jwtService *auth.JWTService) *Server {
+func NewServer(cfg *config.Config, logger *zap.Logger, handlers *handlers.Handlers,
+	jwtService service.JWTService, authService service.AuthService) *Server {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
@@ -40,11 +42,12 @@ func NewServer(cfg *config.Config, logger *zap.Logger, handlers *handlers.Handle
 	e.Server.IdleTimeout = 120 * time.Second
 
 	return &Server{
-		echo:       e,
-		cfg:        cfg,
-		logger:     logger,
-		handlers:   handlers,
-		jwtService: jwtService,
+		echo:        e,
+		cfg:         cfg,
+		logger:      logger,
+		handlers:    handlers,
+		jwtService:  jwtService,
+		authService: authService,
 	}
 }
 
@@ -58,9 +61,11 @@ func (s *Server) Setup() error {
 
 	// CORS configuration
 	s.echo.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		AllowOrigins:     []string{"*"}, // In production, specify domains
-		AllowMethods:     []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete, http.MethodOptions},
-		AllowHeaders:     []string{echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept, echo.HeaderAuthorization, "X-Requested-With"},
+		AllowOrigins: []string{"*"}, // In production, specify domains
+		AllowMethods: []string{http.MethodGet, http.MethodHead, http.MethodPut,
+			http.MethodPatch, http.MethodPost, http.MethodDelete, http.MethodOptions},
+		AllowHeaders: []string{echo.HeaderOrigin, echo.HeaderContentType,
+			echo.HeaderAccept, echo.HeaderAuthorization, "X-Requested-With"},
 		AllowCredentials: true,
 		MaxAge:           86400,
 	}))
@@ -91,7 +96,7 @@ func (s *Server) Setup() error {
 
 	// Protected routes (require authentication)
 	protected := api.Group("")
-	protected.Use(middleware.JWTAuth(s.jwtService))
+	protected.Use(apimiddleware.JWTAuth(s.jwtService, s.logger))
 	{
 		// User profile
 		protected.GET("/profile", s.handlers.User.GetProfile)
@@ -139,7 +144,7 @@ func (s *Server) Setup() error {
 		protected.GET("/contacts", s.handlers.Contact.ListContacts)
 		protected.POST("/contacts", s.handlers.Contact.CreateContact)
 		protected.GET("/contacts/search", s.handlers.Contact.SearchContacts)
-		protected.GET("/contacts/:id", s.handlers.Contact.GetEmail) // Note: GetEmail handles both emails and contacts
+		protected.GET("/contacts/:id", s.handlers.Contact.GetEmail)
 		protected.PUT("/contacts/:id", s.handlers.Contact.UpdateContact)
 		protected.DELETE("/contacts/:id", s.handlers.Contact.DeleteContact)
 		protected.POST("/contacts/import", s.handlers.Contact.ImportContacts)
@@ -180,8 +185,8 @@ func (s *Server) Setup() error {
 
 	// Admin routes (require admin privileges)
 	admin := api.Group("/admin")
-	admin.Use(middleware.JWTAuth(s.jwtService))
-	admin.Use(middleware.AdminAuth())
+	admin.Use(apimiddleware.JWTAuth(s.jwtService, s.logger))
+	admin.Use(apimiddleware.AdminAuth(s.authService, s.logger))
 	{
 		admin.GET("/users", s.handlers.Admin.ListUsers)
 		admin.GET("/users/:id", s.handlers.Admin.GetUser)
@@ -216,65 +221,38 @@ func (s *Server) Start() error {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	if s.cfg.Server.TLSEnabled {
-		s.logger.Info("Starting HTTPS server with TLS")
-		return s.httpServer.ListenAndServeTLS(
-			s.cfg.Server.TLSCertPath,
-			s.cfg.Server.TLSKeyPath,
-		)
-	}
-
-	s.logger.Info("Starting HTTP server (no TLS)")
 	return s.httpServer.ListenAndServe()
 }
 
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.logger.Info("Shutting down HTTP server")
-
 	if s.httpServer != nil {
 		return s.httpServer.Shutdown(ctx)
 	}
-
 	return nil
 }
 
-// loggingMiddleware provides request logging
+// loggingMiddleware returns a middleware that logs requests
 func (s *Server) loggingMiddleware() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			start := time.Now()
-
-			// Process request
 			err := next(c)
+			stop := time.Now()
 
-			// Log request
 			req := c.Request()
 			res := c.Response()
 
-			latency := time.Since(start)
-
-			fields := []zap.Field{
-				zap.String("method", req.Method),
-				zap.String("uri", req.RequestURI),
-				zap.String("ip", c.RealIP()),
-				zap.Int("status", res.Status),
-				zap.Duration("latency", latency),
-				zap.String("user_agent", req.UserAgent()),
-			}
-
-			if err != nil {
-				fields = append(fields, zap.Error(err))
-			}
-
-			// Log at appropriate level based on status code
-			switch {
-			case res.Status >= 500:
-				s.logger.Error("Server error", fields...)
-			case res.Status >= 400:
-				s.logger.Warn("Client error", fields...)
-			default:
-				s.logger.Info("Request processed", fields...)
+			// Log only if there's an error or if it's a non-healthcheck request
+			if err != nil || !strings.Contains(req.URL.Path, "/health") {
+				s.logger.Info("request",
+					zap.String("method", req.Method),
+					zap.String("path", req.URL.Path),
+					zap.Int("status", res.Status),
+					zap.Duration("duration", stop.Sub(start)),
+					zap.String("ip", c.RealIP()),
+					zap.String("user_agent", req.UserAgent()),
+				)
 			}
 
 			return err
@@ -282,39 +260,28 @@ func (s *Server) loggingMiddleware() echo.MiddlewareFunc {
 	}
 }
 
-// customHTTPErrorHandler provides custom error responses
+// customHTTPErrorHandler handles errors in a consistent way
 func (s *Server) customHTTPErrorHandler(err error, c echo.Context) {
 	code := http.StatusInternalServerError
 	message := "Internal Server Error"
 
 	if he, ok := err.(*echo.HTTPError); ok {
 		code = he.Code
-		message = fmt.Sprintf("%v", he.Message)
-		if he.Internal != nil {
-			s.logger.Error("HTTP error with internal error",
-				zap.Int("code", code),
-				zap.String("message", message),
-				zap.Error(he.Internal))
-		}
-	} else {
-		s.logger.Error("Unhandled error", zap.Error(err))
+		message = he.Message.(string)
 	}
 
-	// Don't send error details in production for 5xx errors
-	if code >= 500 && s.cfg.Server.Host != "localhost" {
-		message = "Internal Server Error"
-	}
+	// Log error
+	s.logger.Error("HTTP error",
+		zap.Int("code", code),
+		zap.String("message", message),
+		zap.String("path", c.Path()),
+		zap.String("method", c.Request().Method),
+	)
 
-	// JSON response for API routes
-	if strings.HasPrefix(c.Request().URL.Path, "/api/") {
-		c.JSON(code, map[string]interface{}{
-			"error":   http.StatusText(code),
-			"message": message,
-			"code":    code,
-		})
-		return
-	}
-
-	// HTML response for web routes
-	c.String(code, message)
+	// Send JSON response
+	c.JSON(code, map[string]interface{}{
+		"error":   http.StatusText(code),
+		"message": message,
+		"code":    code,
+	})
 }

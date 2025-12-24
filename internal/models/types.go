@@ -2,9 +2,6 @@
 package models
 
 import (
-	"database/sql/driver"
-	"encoding/json"
-	"errors"
 	"time"
 )
 
@@ -28,65 +25,6 @@ type Timestamps struct {
 	CreatedAt time.Time  `json:"created_at" gorm:"default:CURRENT_TIMESTAMP"`
 	UpdatedAt time.Time  `json:"updated_at" gorm:"default:CURRENT_TIMESTAMP"`
 	DeletedAt *time.Time `json:"deleted_at,omitempty" gorm:"index"`
-}
-
-// Scan implements sql.Scanner interface
-func (j *JSONB) Scan(value interface{}) error {
-	if value == nil {
-		*j = make(JSONB)
-		return nil
-	}
-	bytes, ok := value.([]byte)
-	if !ok {
-		return errors.New("failed to unmarshal JSONB value")
-	}
-	return json.Unmarshal(bytes, j)
-}
-
-// Value implements driver.Valuer interface
-func (j JSONB) Value() (driver.Value, error) {
-	if j == nil {
-		return nil, nil
-	}
-	return json.Marshal(j)
-}
-
-// Scan implements sql.Scanner interface
-func (s *StringArray) Scan(value interface{}) error {
-	if value == nil {
-		*s = []string{}
-		return nil
-	}
-	bytes, ok := value.([]byte)
-	if !ok {
-		return errors.New("failed to unmarshal string array")
-	}
-
-	// PostgreSQL text array format: {elem1,elem2,elem3}
-	str := string(bytes)
-	if len(str) < 2 {
-		*s = []string{}
-		return nil
-	}
-
-	// Remove braces and split
-	str = str[1 : len(str)-1]
-	if str == "" {
-		*s = []string{}
-		return nil
-	}
-
-	*s = parsePostgresArray(str)
-	return nil
-}
-
-// Value implements driver.Valuer interface
-func (s StringArray) Value() (driver.Value, error) {
-	if s == nil {
-		return nil, nil
-	}
-	// Format as PostgreSQL array
-	return "{" + joinPostgresArray(s) + "}", nil
 }
 
 // Helper functions for PostgreSQL array handling
