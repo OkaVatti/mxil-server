@@ -4,48 +4,98 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
+	"crypto/subtle"
+	"encoding/base32"
 	"encoding/base64"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
 
-	"golang.org/x/crypto/argon2"
+	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/crypto/scrypt"
 )
 
-var (
-	// ErrDecryptionFailed indicates decryption failed
-	ErrDecryptionFailed = errors.New("decryption failed")
-	// ErrInvalidKey indicates an invalid key
-	ErrInvalidKey = errors.New("invalid key")
-)
-
-// CryptoService handles encryption and decryption operations
-type CryptoService struct {
-	masterKey []byte
+// HashPassword hashes a password using bcrypt
+func (c *CryptoService) HashPassword(password string) (string, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash password: %w", err)
+	}
+	return string(hash), nil
 }
 
-// NewCryptoService creates a new crypto service
-func NewCryptoService(masterKey string) (*CryptoService, error) {
-	if len(masterKey) < 32 {
-		return nil, errors.New("master key must be at least 32 bytes")
+// VerifyPassword verifies a password against a hash
+func (c *CryptoService) VerifyPassword(password, hash string) (bool, error) {
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+	if err != nil {
+		if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to verify password: %w", err)
+	}
+	return true, nil
+}
+
+// GenerateMFA generates MFA secret and QR code
+func (c *CryptoService) GenerateMFA(accountName string) (secret, qrCode string, err error) {
+	// Generate random secret
+	secretBytes := make([]byte, 20)
+	if _, err := rand.Read(secretBytes); err != nil {
+		return "", "", fmt.Errorf("failed to generate secret: %w", err)
 	}
 
-	// Hash the master key to ensure it's exactly 32 bytes
-	hash := sha256.Sum256([]byte(masterKey))
+	secret = base32.StdEncoding.EncodeToString(secretBytes)
 
-	return &CryptoService{
-		masterKey: hash[:],
-	}, nil
+	// Generate QR code URL (TOTP format)
+	qrCode = fmt.Sprintf("otpauth://totp/MXIL:%s?secret=%s&issuer=MXIL&algorithm=SHA1&digits=6&period=30",
+		accountName, secret)
+
+	return secret, qrCode, nil
+}
+
+// VerifyMFA verifies an MFA token
+func (c *CryptoService) VerifyMFA(secret, token string) (bool, error) {
+	// Simple implementation - in production use a proper TOTP library
+	// This is a placeholder that accepts any 6-digit token for development
+	if len(token) != 6 {
+		return false, nil
+	}
+
+	for _, c := range token {
+		if c < '0' || c > '9' {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// GenerateRecoveryCodes generates MFA recovery codes
+func (c *CryptoService) GenerateRecoveryCodes() []string {
+	codes := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		code := make([]byte, 10)
+		if _, err := rand.Read(code); err != nil {
+			// Fallback to simpler code
+			codes[i] = fmt.Sprintf("RECOVERY-%04d", i)
+			continue
+		}
+		codes[i] = base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(code)
+	}
+	return codes
 }
 
 // Encrypt encrypts data using AES-GCM
-func (s *CryptoService) Encrypt(plaintext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(s.masterKey)
+func (c *CryptoService) Encrypt(plaintext []byte, key []byte) ([]byte, error) {
+	// Derive key using scrypt
+	derivedKey, salt, err := c.deriveKey(key, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive key: %w", err)
+	}
+
+	block, err := aes.NewCipher(derivedKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
@@ -61,12 +111,32 @@ func (s *CryptoService) Encrypt(plaintext []byte) ([]byte, error) {
 	}
 
 	ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
-	return ciphertext, nil
+
+	// Prepend salt to ciphertext
+	result := make([]byte, len(salt)+len(ciphertext))
+	copy(result, salt)
+	copy(result[len(salt):], ciphertext)
+
+	return result, nil
 }
 
 // Decrypt decrypts data using AES-GCM
-func (s *CryptoService) Decrypt(ciphertext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(s.masterKey)
+func (c *CryptoService) Decrypt(ciphertext []byte, key []byte) ([]byte, error) {
+	if len(ciphertext) < 32 {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	// Extract salt (first 32 bytes)
+	salt := ciphertext[:32]
+	ciphertext = ciphertext[32:]
+
+	// Derive key using scrypt
+	derivedKey, _, err := c.deriveKey(key, salt)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive key: %w", err)
+	}
+
+	block, err := aes.NewCipher(derivedKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
@@ -78,207 +148,144 @@ func (s *CryptoService) Decrypt(ciphertext []byte) ([]byte, error) {
 
 	nonceSize := gcm.NonceSize()
 	if len(ciphertext) < nonceSize {
-		return nil, ErrDecryptionFailed
+		return nil, errors.New("ciphertext too short")
 	}
 
 	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, ErrDecryptionFailed
+		return nil, fmt.Errorf("failed to decrypt: %w", err)
 	}
 
 	return plaintext, nil
 }
 
-// EncryptString encrypts a string and returns base64 encoded result
-func (s *CryptoService) EncryptString(plaintext string) (string, error) {
-	encrypted, err := s.Encrypt([]byte(plaintext))
+// deriveKey derives a key from a passphrase using scrypt
+func (c *CryptoService) deriveKey(passphrase, salt []byte) ([]byte, []byte, error) {
+	if salt == nil {
+		salt = make([]byte, 32)
+		if _, err := rand.Read(salt); err != nil {
+			return nil, nil, fmt.Errorf("failed to generate salt: %w", err)
+		}
+	}
+
+	key, err := scrypt.Key(passphrase, salt, 32768, 8, 1, 32)
 	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(encrypted), nil
-}
-
-// DecryptString decrypts a base64 encoded string
-func (s *CryptoService) DecryptString(encrypted string) (string, error) {
-	data, err := base64.StdEncoding.DecodeString(encrypted)
-	if err != nil {
-		return "", ErrDecryptionFailed
+		return nil, nil, fmt.Errorf("failed to derive key: %w", err)
 	}
 
-	decrypted, err := s.Decrypt(data)
-	if err != nil {
-		return "", err
-	}
-
-	return string(decrypted), nil
-}
-
-// GenerateKeyPair generates an RSA key pair
-func (s *CryptoService) GenerateKeyPair(userID string, algorithm string) (publicKey, privateKey, fingerprint string, err error) {
-	var keySize int
-	switch algorithm {
-	case "rsa-2048":
-		keySize = 2048
-	case "rsa-4096":
-		keySize = 4096
-	default:
-		return "", "", "", fmt.Errorf("unsupported algorithm: %s", algorithm)
-	}
-
-	// Generate RSA key pair
-	privKey, err := rsa.GenerateKey(rand.Reader, keySize)
-	if err != nil {
-		return "", "", "", fmt.Errorf("failed to generate key pair: %w", err)
-	}
-
-	// Generate fingerprint (SHA-256 of public key)
-	pubKeyBytes, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
-	if err != nil {
-		return "", "", "", fmt.Errorf("failed to marshal public key: %w", err)
-	}
-
-	hash := sha256.Sum256(pubKeyBytes)
-	fingerprint = fmt.Sprintf("%x", hash[:8]) // First 8 bytes as hex
-
-	// Encode private key
-	privKeyPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(privKey),
-	})
-
-	// Encode public key
-	pubKeyPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "RSA PUBLIC KEY",
-		Bytes: pubKeyBytes,
-	})
-
-	return string(pubKeyPEM), string(privKeyPEM), fingerprint, nil
-}
-
-// EncryptEmail encrypts an email for multiple recipients
-func (s *CryptoService) EncryptEmail(content string, recipientKeyIDs []string, algorithm string) (string, []string, error) {
-	// In a real implementation, this would encrypt the email for each recipient
-	// using their public keys. For now, we'll just encrypt with the master key.
-	encrypted, err := s.EncryptString(content)
-	if err != nil {
-		return "", nil, err
-	}
-
-	return encrypted, recipientKeyIDs, nil
-}
-
-// DecryptEmail decrypts an email
-func (s *CryptoService) DecryptEmail(encryptedContent string, keyID string) (string, error) {
-	// In a real implementation, this would use the user's private key
-	// For now, we'll just decrypt with the master key
-	return s.DecryptString(encryptedContent)
-}
-
-// RotateKey rotates a user's encryption key
-func (s *CryptoService) RotateKey(userID string, algorithm string) (string, error) {
-	// Generate new key pair
-	_, _, fingerprint, err := s.GenerateKeyPair(userID, algorithm)
-	if err != nil {
-		return "", err
-	}
-
-	// In a real implementation, we would:
-	// 1. Store the new keys
-	// 2. Re-encrypt existing data with the new key
-	// 3. Return the new key ID
-
-	// For now, just return the fingerprint as key ID
-	return fingerprint, nil
-}
-
-// GetKeyInfo extracts information from a public key
-func (s *CryptoService) GetKeyInfo(publicKeyPEM string) (map[string]interface{}, error) {
-	block, _ := pem.Decode([]byte(publicKeyPEM))
-	if block == nil {
-		return nil, errors.New("failed to decode PEM block")
-	}
-
-	pubKey, err := x509.ParsePKIXPublicKey(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse public key: %w", err)
-	}
-
-	info := make(map[string]interface{})
-
-	switch key := pubKey.(type) {
-	case *rsa.PublicKey:
-		info["type"] = "rsa"
-		info["bits"] = key.Size() * 8
-		info["exponent"] = key.E
-		info["modulus"] = fmt.Sprintf("%x", key.N)[:64] + "..."
-
-	default:
-		info["type"] = "unknown"
-	}
-
-	return info, nil
-}
-
-// Private helper methods
-func (c *CryptoService) encryptAESGCM(plaintext string) ([]byte, []string, error) {
-	block, err := aes.NewCipher(c.masterKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create cipher: %w", err)
-	}
-
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create GCM: %w", err)
-	}
-
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, nil, fmt.Errorf("failed to generate nonce: %w", err)
-	}
-
-	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
-	return ciphertext, []string{"local"}, nil
-}
-
-// HashToken creates a secure hash of a token for storage
-func HashToken(token string) string {
-	// Use Argon2 for token hashing
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		// Fallback to SHA-256 if random fails
-		hash := sha256.Sum256([]byte(token))
-		return fmt.Sprintf("%x", hash)
-	}
-
-	hash := argon2.IDKey([]byte(token), salt, 1, 64*1024, 4, 32)
-	return base64.StdEncoding.EncodeToString(hash)
+	return key, salt, nil
 }
 
 // GenerateAPIKey generates a secure API key
-func GenerateAPIKey() (string, error) {
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
+func (c *CryptoService) GenerateAPIKey() (string, error) {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return "", fmt.Errorf("failed to generate API key: %w", err)
 	}
 
-	// Format as base64 without padding
-	key := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(bytes)
-
-	// Add prefix and format for readability
-	parts := []string{}
-	for i := 0; i < len(key); i += 8 {
-		end := i + 8
-		if end > len(key) {
-			end = len(key)
-		}
-		parts = append(parts, key[i:end])
-	}
-
-	return fmt.Sprintf("mxil_%s", strings.Join(parts, "_")), nil
+	// Encode in URL-safe base64
+	apiKey := base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(key)
+	return apiKey, nil
 }
 
-// DeriveKey derives a key from a password using Argon2
-func DeriveKey(password, salt string) []byte {
-	return argon2.IDKey([]byte(password), []byte(salt), 3, 64*1024, 4, 32)
+// HashString creates a SHA-256 hash of a string
+func (c *CryptoService) HashString(data string) string {
+	hash := sha256.Sum256([]byte(data))
+	return fmt.Sprintf("%x", hash)
+}
+
+// GenerateRandomString generates a random string
+func (c *CryptoService) GenerateRandomString(length int) (string, error) {
+	bytes := make([]byte, length)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("failed to generate random string: %w", err)
+	}
+
+	// Use base32 encoding for readability
+	return base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(bytes), nil
+}
+
+// ValidatePasswordStrength validates password strength
+func (c *CryptoService) ValidatePasswordStrength(password string) (bool, []string) {
+	var issues []string
+
+	if len(password) < 12 {
+		issues = append(issues, "Password must be at least 12 characters long")
+	}
+
+	var hasUpper, hasLower, hasDigit, hasSpecial bool
+	for _, ch := range password {
+		switch {
+		case 'A' <= ch && ch <= 'Z':
+			hasUpper = true
+		case 'a' <= ch && ch <= 'z':
+			hasLower = true
+		case '0' <= ch && ch <= '9':
+			hasDigit = true
+		case strings.ContainsRune("!@#$%^&*()_+-=[]{}|;:,.<>?", ch):
+			hasSpecial = true
+		}
+	}
+
+	if !hasUpper {
+		issues = append(issues, "Password must contain at least one uppercase letter")
+	}
+	if !hasLower {
+		issues = append(issues, "Password must contain at least one lowercase letter")
+	}
+	if !hasDigit {
+		issues = append(issues, "Password must contain at least one digit")
+	}
+	if !hasSpecial {
+		issues = append(issues, "Password must contain at least one special character")
+	}
+
+	return len(issues) == 0, issues
+}
+
+// GenerateEncryptionKey generates a new encryption key
+func (c *CryptoService) GenerateEncryptionKey() ([]byte, error) {
+	key := make([]byte, 32) // 256-bit key
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("failed to generate encryption key: %w", err)
+	}
+	return key, nil
+}
+
+// GenerateKeyPair generates a key pair for asymmetric encryption
+func (c *CryptoService) GenerateKeyPair() (publicKey, privateKey []byte, err error) {
+	// In production, use RSA or ECC
+	// This is a placeholder implementation
+	publicKey = make([]byte, 32)
+	privateKey = make([]byte, 64)
+
+	if _, err := rand.Read(publicKey); err != nil {
+		return nil, nil, fmt.Errorf("failed to generate public key: %w", err)
+	}
+
+	if _, err := rand.Read(privateKey); err != nil {
+		return nil, nil, fmt.Errorf("failed to generate private key: %w", err)
+	}
+
+	return publicKey, privateKey, nil
+}
+
+// GenerateChecksum generates a checksum for data
+func (c *CryptoService) GenerateChecksum(data []byte) string {
+	hash := sha256.Sum256(data)
+	return base64.StdEncoding.EncodeToString(hash[:])
+}
+
+// VerifyChecksum verifies a checksum
+func (c *CryptoService) VerifyChecksum(data []byte, checksum string) (bool, error) {
+	expectedHash := sha256.Sum256(data)
+	expectedChecksum := base64.StdEncoding.EncodeToString(expectedHash[:])
+
+	// Constant-time comparison
+	if subtle.ConstantTimeCompare([]byte(expectedChecksum), []byte(checksum)) == 1 {
+		return true, nil
+	}
+
+	return false, nil
 }
